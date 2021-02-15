@@ -1,3 +1,5 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 import pymc3 as pm
 import theano.tensor as tt
 import numpy as np
@@ -5,22 +7,37 @@ from scipy import sparse
 import logging
 import pickle
 import json
-import argparse
 import arviz as az
-from lisa import FromRegions
+from lisa import FromRegions, parse_regions_file
 from collections import Counter
-from scipy.stats import beta
 import pickle
 from pymc3.variational.callbacks import CheckParametersConvergence
+from joblib import Parallel, delayed
+import os
+import fire
 
+from theano import theano_logger
+theano_logger.setLevel(logging.ERROR)
+
+logging.basicConfig()
 logger = logging.getLogger('RPModel')
-logger.setLevel(logging.WARN)
+logger.setLevel(logging.INFO)
 
 
 class TopicRPFeatureFactory:
 
-    rp_range = 30000
+    rp_range = 40000
 
+    @classmethod
+    def fit_models(cls,*, genes, peaks, species, region_topic_distribution, cell_topic_distribution, 
+            read_depth, expr_matrix, n_jobs = -1, file_prefix = './'):
+
+        gene_factory = cls(peaks, species, region_topic_distribution)
+
+        return gene_factory.train_gene_models(genes, cell_topic_distribution=cell_topic_distribution, 
+            expr_matrix = expr_matrix, read_depth=read_depth, n_jobs=n_jobs, file_prefix=file_prefix)
+
+        
     def __init__(self, peaks, species, region_topic_distribution):
 
         self.regions_test = FromRegions(species, peaks, rp_map='basic', rp_decay=self.rp_range)
@@ -30,9 +47,9 @@ class TopicRPFeatureFactory:
         self.region_topic_distribution = region_topic_distribution[:, self.region_score_map]
 
 
-    def get_gene_weights(self, gene_model, cell_topic_distributions):
+    def get_gene_weights(self, gene_model, cell_topic_distribution):
 
-        return np.dot(cell_topic_distributions, self.region_topic_distribution[:, gene_model.region_mask])
+        return np.dot(cell_topic_distribution, self.region_topic_distribution[:, gene_model.region_mask])
 
 
     def get_gene_model(self, gene_symbol, type = 'VI'):
@@ -79,6 +96,43 @@ class TopicRPFeatureFactory:
         else:
             return AssymetricalRPModelVI(gene_symbol, **kwargs)
 
+    def train_gene_models(self, gene_symbols,*,cell_topic_distribution, expr_matrix, read_depth, n_jobs = -1, file_prefix='./'):
+
+        def train_fn(args):
+
+            try:
+            
+                model, weights, expr, read_depth = args
+
+                model.fit(weights, expr, read_depth)
+
+                model.write_summary(file_prefix + model.gene_symbol + '_expr.json')
+
+                logger.info(model.gene_symbol + ': Done!')
+
+            except Exception as err:
+                logger.error(model.gene_symbol + ': ' + str(repr(err)))
+
+
+        logger.info('Compiling models ...')
+        data = []
+        for i, symbol in enumerate(gene_symbols):
+
+            try:
+                model = self.get_gene_model(symbol)
+                weights = self.get_gene_weights(model, cell_topic_distribution)
+
+                data.append((model, weights, expr_matrix[:,i], read_depth))
+            except Exception as err:
+                logger.error(symbol + ': ' + str(repr(err)))
+
+        logger.info('Compiled {} models.'.format(len(data)))
+        logger.info('Parallelizing training ...')
+        fit_models = Parallel(n_jobs= n_jobs, verbose=10)([
+            delayed(train_fn)(gene_data) for gene_data in data
+        ])
+
+        return fit_models
 
 class AssymetricalRPModel:
 
@@ -212,6 +266,132 @@ class AssymetricalRPModel:
 
 class ConvergenceError(Exception):
     pass
+
+class AssymetricalRPModelVI(AssymetricalRPModel):
+
+    batch_size = 256
+    var_names = ['a','b','theta','log_distance']
+
+    #____ MODEL TRAINING _____
+    def make_model(self, weights, expression, read_depth):
+
+        def RP(w, d, l):
+            return tt.sum(w * tt.power(0.5, d.reshape((1,-1)) / (1e3 * tt.exp(l)) ), axis = 1).reshape((-1,))
+
+        upstream_distances = self.region_distances[self.upstream_mask]
+        downstream_distances = self.region_distances[self.downstream_mask]
+
+        upstream_batches, downstream_batches, promoter_batches, expression_batches, read_depth_batches = \
+            pm.Minibatch(weights[:,  self.upstream_mask ].copy(), self.batch_size), pm.Minibatch(weights[:, self.downstream_mask ].copy(), self.batch_size), \
+            pm.Minibatch(weights[:, self.promoter_mask ].copy(), self.batch_size), pm.Minibatch(expression, self.batch_size), pm.Minibatch(read_depth, self.batch_size)
+
+        logger.debug('Upstream weights shape: ' + str(weights[:,  self.upstream_mask ].copy().shape))
+        logger.debug('Downstream weights shape: ' + str(weights[:,  self.downstream_mask ].copy().shape))
+        logger.debug('Upstream weights shape: ' + str(weights[:,  self.promoter_mask].copy().shape))
+        logger.debug('Batch size: ' + str(self.batch_size))
+
+        with pm.Model() as model:
+            
+            d = pm.Normal('log_distance', mu = np.e, sigma = 1, shape = 2, testval=np.e)
+            
+            pm.Deterministic('distance', tt.exp(d))
+            
+            a = pm.HalfNormal('a', sigma=10000, shape = 3, testval = 1e3)
+            b = pm.Normal('b', sigma = 15, mu = 0, shape = 1, testval=-10)
+            
+            theta = pm.Gamma('theta', alpha = 2, beta = 2, shape = 1, testval = 2)
+            
+            rp_upstream = a[0] * RP(upstream_batches, upstream_distances, d[0])
+            rp_downstream = a[1] * RP(downstream_batches, downstream_distances, d[1])
+            rp_promoter = a[2] * tt.sum(promoter_batches, axis = 1).reshape((-1,))
+            
+            log_rate_expr = rp_upstream + rp_promoter + rp_downstream + b
+            
+            # Sample observed gene expression
+            X = pm.NegativeBinomial('expr', mu = read_depth_batches * tt.exp(log_rate_expr), alpha = theta, 
+                observed = expression_batches, total_size = len(expression))
+
+        return model
+
+
+    def summarize_trace(self, model, trace, metric = np.mean):
+
+        summary = dict()
+        with model:
+            #summary['posterior_summary'] = az.summary(trace, var_names = ['a','b','theta','log_distance']).to_dict()
+            for var in  self.var_names:
+                summary[var] = metric(trace[var], axis = 0).tolist()
+
+                summary[var + '_samples'] = trace[var].tolist()
+
+        return summary
+
+    def write_summary(self, filename):
+
+        with open(filename, 'w') as f:
+            json.dump(self.summary, f)
+
+    def load_summary(self, filename):
+
+        with open(filename, 'r') as f:
+            self.summary = json.load(f)
+
+        for param in self.var_names:
+            self.__setattr__(param, self.summary[param])
+
+
+    def fit(self, weights, expression, read_depth, method = 'advi'):
+
+        expression = np.array(expression).astype(np.float64)
+        read_depth = np.array(read_depth).astype(np.int64)
+        weights = np.array(weights).astype(np.float64)
+
+        assert(expression.shape[0] == read_depth.shape[0] == weights.shape[0])
+        assert(len(expression.shape) == 1)
+        assert(len(read_depth.shape) == 1)
+        assert(self.region_distances.shape == (weights.shape[1],))
+        assert(len(weights.shape) == 2)
+        assert(weights.shape[1] == len(self.region_distances))
+        
+        logging.info('Building model ...')
+        self.model = self.make_model(weights, expression, read_depth)
+            
+        logging.info('Training ...')
+        with self.model:
+            mean_field = pm.fit(200000, method=method, progressbar = False,
+                callbacks = [CheckParametersConvergence(every=100, tolerance=0.001,diff='relative')])
+
+            self.trace = mean_field.sample(500)
+
+        self.summary = self.summarize_trace(self.model, self.trace)
+
+        for param in self.var_names:
+            self.__setattr__(param, self.summary[param])
+
+        return self
+
+    def compute_lambda_mean_posterior(self, region_weights, return_components = False):
+
+        upstream_weights = region_weights[:,  self.upstream_mask ]
+        downstream_weights = region_weights[:, self.downstream_mask ]
+        promoter_weights = region_weights[:, self.promoter_mask ]
+
+        upstream_distances = self.region_distances[self.upstream_mask]
+        downstream_distances = self.region_distances[self.downstream_mask]
+
+        a, d, b = self.a, self.log_distance, self.b
+
+        upstream_effects = a[0] * np.sum(upstream_weights * np.power(0.5, upstream_distances/ (1e3 * np.exp(d[0])) ), axis = 1)
+        downstream_effects = a[1] * np.sum(downstream_weights * np.power(0.5, downstream_distances/ (1e3 * np.exp(d[1]))), axis = 1)
+        promoter_effects = a[2] * np.sum(promoter_weights, axis = 1)
+        
+        lam = np.exp(upstream_effects + promoter_effects + downstream_effects + b[0])
+
+        if return_components:
+            return lam, upstream_effects, promoter_effects, downstream_effects
+        else:
+            return lam
+        
     
 class AssymetricalRPModelMAP(AssymetricalRPModel):
 
@@ -279,125 +459,6 @@ class AssymetricalRPModelMAP(AssymetricalRPModel):
                 write_dict[param] = vals.tolist()
                 
             json.dump(write_dict, f, indent=4)
-
-
-
-class AssymetricalRPModelVI(AssymetricalRPModel):
-
-    batch_size = 512
-    var_names = ['a','b','theta','log_distance']
-
-    #____ MODEL TRAINING _____
-    def make_model(self, weights, expression, read_depth):
-
-        def RP(w, d, l):
-            return tt.sum(w * tt.power(0.5, d.reshape((1,-1)) / (1e3 * tt.exp(l)) ), axis = 1).reshape((-1,))
-
-        upstream_distances = self.region_distances[self.upstream_mask]
-        downstream_distances = self.region_distances[self.downstream_mask]
-
-        upstream_batches, downstream_batches, promoter_batches, expression_batches, read_depth_batches = \
-            pm.Minibatch(weights[:,  self.upstream_mask ], self.batch_size), pm.Minibatch(weights[:, self.downstream_mask ], self.batch_size), \
-            pm.Minibatch(weights[:, self.promoter_mask ], self.batch_size), pm.Minibatch(expression, self.batch_size), pm.Minibatch(read_depth, self.batch_size)
-
-        with pm.Model() as model:
-            
-            d = pm.Normal('log_distance', mu = np.e, sigma = 1, shape = 2, testval=np.e)
-            
-            pm.Deterministic('distance', tt.exp(d))
-            
-            a = pm.HalfNormal('a', sigma=40000, shape = 3, testval = 1e3)
-            b = pm.Normal('b', sigma = 15, mu = 0, shape = 1, testval=-10)
-            
-            theta = pm.Gamma('theta', alpha = 2, beta = 2, shape = 1, testval = 2)
-            
-            rp_upstream = a[0] * RP(upstream_batches, upstream_distances, d[0])
-            rp_downstream = a[1] * RP(downstream_batches, downstream_distances, d[1])
-            rp_promoter = a[2] * tt.sum(promoter_batches, axis = 1).reshape((-1,))
-            
-            log_rate_expr = rp_upstream + rp_promoter + rp_downstream + b
-            
-            # Sample observed gene expression
-            X = pm.NegativeBinomial('expr', mu = read_depth_batches * tt.exp(log_rate_expr), alpha = theta, observed = expression_batches, total_size = len(expression))
-
-        return model
-
-
-    def summarize_trace(self, model, trace, metric = np.mean):
-
-        summary = dict()
-        with model:
-            summary['posterior_summary'] = az.summary(trace).to_dict()
-
-            for var in  self.var_names:
-                summary[var] = metric(trace[var], axis = 0).tolist()
-
-        return summary
-
-    def write_summary(self, filename):
-
-        with open(filename, 'w') as f:
-            json.dump(self.summary, f)
-
-    def load_summary(self, filename):
-
-        with open(filename, 'r') as f:
-            self.summary = json.load(f)
-
-        for param in self.var_names:
-            self.__setattr__(param, self.summary[param])
-
-
-    def fit(self, weights, expression, read_depth):
-
-        expression = np.array(expression).astype(np.float64)
-        read_depth = np.array(read_depth).astype(np.int64)
-        weights = np.array(weights).astype(np.float64)
-
-        assert(expression.shape[0] == read_depth.shape[0] == weights.shape[0])
-        assert(len(expression.shape) == 1)
-        assert(len(read_depth.shape) == 1)
-        assert(self.region_distances.shape == (weights.shape[1],))
-        assert(len(weights.shape) == 2)
-        assert(weights.shape[1] == len(self.region_distances))
-        
-        logging.info('Building model ...')
-        self.model = self.make_model(weights, expression, read_depth)
-            
-        logging.info('Training ...')
-        with self.model:
-            mean_field = pm.fit(20000, method="advi", callbacks = [CheckParametersConvergence(every=100, tolerance=0.01,diff='absolute')])
-
-            self.trace = mean_field.sample(1000)
-
-        self.summary = self.summarize_trace(self.model, self.trace)
-
-        for param in self.var_names:
-            self.__setattr__(param, self.summary[param])
-
-        return self
-
-    def compute_lambda_mean_posterior(self, region_weights, return_components = False):
-
-        upstream_weights = region_weights[:,  self.upstream_mask ]
-        downstream_weights = region_weights[:, self.downstream_mask ]
-        promoter_weights = region_weights[:, self.promoter_mask ]
-
-        upstream_distances = self.region_distances[self.upstream_mask]
-        downstream_distances = self.region_distances[self.downstream_mask]
-
-        a, d, b = self.a, self.log_distance, self.b
-
-        upstream_effects = a[0] * np.sum(upstream_weights * np.power(0.5, upstream_distances/ (1e3 * np.exp(d[0])) ), axis = 1)
-        downstream_effects = a[1] * np.sum(downstream_weights * np.power(0.5, downstream_distances/ (1e3 * np.exp(d[1]))), axis = 1)
-        promoter_effects = a[2] * np.sum(promoter_weights, axis = 1)
-        
-        lam = np.exp(upstream_effects + promoter_effects + downstream_effects + b[0])
-
-        if return_components:
-            return lam, upstream_effects, promoter_effects, downstream_effects
-        else:
-            return lam
 
 
 class AssymetricalRPModelMCMC(AssymetricalRPModel):
@@ -532,42 +593,30 @@ class AssymetricalRPModelMCMC(AssymetricalRPModel):
         return vals/len(self.phi)
 
 
-def main(*,gene_symbol, topic_model_file, expression_file, model_output):
+def main(*,genes_file, species, peaks_file, read_depth_array, expr_matrix, cell_topic_distribution_matrix, 
+    region_topic_distribution_matrix, n_jobs = -1, file_prefix='./'):
 
-    logging.info('Loading data ...')
-    
-    with open(topic_model_file, 'r') as f:
-        data = json.load(f)
+    peaks, _ = parse_regions_file(peaks_file)
 
-    with open(expression_file, 'r') as f:
-        expression = np.array([int(x.strip()) for x in f.readlines()])
+    cell_topic_distribution = np.load(cell_topic_distribution_matrix)
+    region_topic_distribution = np.load(region_topic_distribution_matrix)
+    read_depth = np.load(read_depth_array)
+    expr = np.load(expr_matrix)
 
-    gene_factory = TopicRPFeatureFactory(data['peaks'], 'mm10', region_topic_distribution = np.array(data['region_topic_distribution']))
+    with open(genes_file, 'r') as f:
+        genes = [x.strip().upper() for x in f.readlines()]
 
-    gene_model = gene_factory.get_gene_model(gene_symbol)
-
-    weights = gene_factory.get_gene_weights(gene_model, np.array(data['cell_topic_distribution']))
-
-    gene_model.fit(
-        weights,
-        expression,
-        np.array(data['read_depth'])
+    TopicRPFeatureFactory.fit_models(
+        genes = genes,
+        peaks = peaks,
+        species = species,
+        read_depth = read_depth,
+        region_topic_distribution = region_topic_distribution,
+        cell_topic_distribution = cell_topic_distribution,
+        expr_matrix = expr,
+        n_jobs= n_jobs,
+        file_prefix= file_prefix
     )
 
-    gene_model.write_summary(model_output)
-    
-    logging.info('Done!')
-
-
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('gene_symbol', type = str)
-    parser.add_argument('topic_model_file', type = str)
-    parser.add_argument('expr_file', type = str)
-    parser.add_argument('model_output', type = str)
-    
-    args = parser.parse_args()
-
-    main(gene_symbol = args.gene_symbol, expression_file = args.expr_file, 
-        topic_model_file = args.topic_model_file, model_output = args.model_output)
+    fire.Fire(main)
