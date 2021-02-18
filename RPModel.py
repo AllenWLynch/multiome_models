@@ -340,7 +340,7 @@ class AssymetricalRPModelVI(AssymetricalRPModel):
             self.__setattr__(param, self.summary[param])
 
 
-    def fit(self, weights, expression, read_depth, method = 'advi'):
+    def fit(self, weights, expression, read_depth, method = 'advi', progressbar=True):
 
         expression = np.array(expression).astype(np.float64)
         read_depth = np.array(read_depth).astype(np.int64)
@@ -358,7 +358,7 @@ class AssymetricalRPModelVI(AssymetricalRPModel):
             
         logging.info('Training ...')
         with self.model:
-            mean_field = pm.fit(200000, method=method, progressbar = False,
+            mean_field = pm.fit(200000, method=method, progressbar = progressbar,
                 callbacks = [CheckParametersConvergence(every=100, tolerance=0.001,diff='relative')])
 
             self.trace = mean_field.sample(500)
