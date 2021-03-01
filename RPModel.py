@@ -9,6 +9,7 @@ import pickle
 import json
 import arviz as az
 from lisa import FromRegions, parse_regions_file
+from lisa.core.utils import LoadingBar
 from collections import Counter
 import pickle
 from pymc3.variational.callbacks import CheckParametersConvergence
@@ -23,6 +24,8 @@ logging.basicConfig()
 logger = logging.getLogger('RPModel')
 logger.setLevel(logging.INFO)
 
+def clr_transform(x):
+        return np.log(x) - np.log(x).mean(axis = -1, keepdims = True)
 
 class TopicRPFeatureFactory:
 
@@ -30,12 +33,12 @@ class TopicRPFeatureFactory:
 
     @classmethod
     def fit_models(cls,*, genes, peaks, species, region_topic_distribution, cell_topic_distribution, 
-            read_depth, expr_matrix, n_jobs = -1, file_prefix = './'):
+            read_depth, expr_matrix, n_jobs = -1, file_prefix = './', type = 'VI'):
 
         gene_factory = cls(peaks, species, region_topic_distribution)
 
         return gene_factory.train_gene_models(genes, cell_topic_distribution=cell_topic_distribution, 
-            expr_matrix = expr_matrix, read_depth=read_depth, n_jobs=n_jobs, file_prefix=file_prefix)
+            expr_matrix = expr_matrix, read_depth=read_depth, n_jobs=n_jobs, file_prefix=file_prefix, type=type)
 
         
     def __init__(self, peaks, species, region_topic_distribution):
@@ -89,50 +92,553 @@ class TopicRPFeatureFactory:
             user_to_model_region_map = self.region_score_map
         )
 
-        if type == 'MAP':
-            return AssymetricalRPModelMAP(gene_symbol, **kwargs)
-        elif type == 'MCMC':
-            return AssymetricalRPModelMCMC(gene_symbol, **kwargs)
-        else:
+        if type == 'VI':
             return AssymetricalRPModelVI(gene_symbol, **kwargs)
+        elif type == 'TopicMixture':
+            return TopicMixtureRPModel(gene_symbol, **kwargs)
+        elif type == 'TopicAdjustment':
+            return TopicAdjustmentModel(gene_symbol, **kwargs)
 
-    def train_gene_models(self, gene_symbols,*,cell_topic_distribution, expr_matrix, read_depth, n_jobs = -1, file_prefix='./'):
 
-        def train_fn(args):
+    def train_gene_models(self, gene_symbols,*,cell_topic_distribution, expr_matrix, read_depth, n_jobs = -1, 
+        file_prefix='./', type = 'TopicMixture', save_model = False):
 
-            try:
+        if not type == 'TransEffect':
+
+            def train_fn(args):
+                model = args[0]
+                
+                try:
+                    model.fit(**args[1], method = 'advi', progressbar=False)
+                    model.write_summary(file_prefix + model.gene_symbol + '_expr.json')
+
+                    if save_model:
+                        with open(file_prefix + model.gene_symbol + '_model.pkl', 'wb') as f:
+                            pickle.dump(model, f)
+
+                    logger.info(model.gene_symbol + ': Done!')
+                    return model.gene_symbol + ': Done!'
+
+                except Exception as err:
+                    logger.error(model.gene_symbol + ': ' + str(repr(err)))
+                    return model.gene_symbol + ': ' + str(repr(err))
+
+
+            logger.info('Compiling models ...')
+            data = []
+            for i, symbol in enumerate(gene_symbols):
+
+                try:
+                    model = self.get_gene_model(symbol, type = type)
+                    weights = self.get_gene_weights(model, cell_topic_distribution)
+
+                    data.append((model, dict(weights = weights, expression = expr_matrix[:,i], read_depth = read_depth, topic_distribution = cell_topic_distribution)))
+
+                except Exception as err:
+                    logger.error(symbol + ': ' + str(repr(err)))
+
+            logger.info('Compiled {} models.'.format(len(data)))
+
+            if n_jobs == 1:
+
+                fit_models = []
+                for i, gene_data in enumerate(data):
+                    fit_models.append(train_fn(gene_data))
+
+                    if i%10 == 0:
+                        logger.info('Trained {} models'.format(str(i)))
+
+            else:
+                logger.info('Parallelizing training ...')
+                fit_models = Parallel(n_jobs= n_jobs, verbose=10)([
+                    delayed(train_fn)(gene_data) for gene_data in data
+                ])
+
+            return fit_models
+    
+        else:
             
-                model, weights, expr, read_depth = args
+            model = TransEffectModel().fit(
+                weights = None,
+                expression = expr_matrix,
+                read_depth = read_depth,
+                topic_distribution = cell_topic_distribution,
+                posterior_samples=100,
+            )
 
-                model.fit(weights, expr, read_depth)
+            with open(file_prefix + 'trans-effect' + '_model.pkl', 'wb') as f:
+                pickle.dump(model, f)
 
-                model.write_summary(file_prefix + model.gene_symbol + '_expr.json')
-
-                logger.info(model.gene_symbol + ': Done!')
-
-            except Exception as err:
-                logger.error(model.gene_symbol + ': ' + str(repr(err)))
+            return ['Done!',]
 
 
-        logger.info('Compiling models ...')
-        data = []
-        for i, symbol in enumerate(gene_symbols):
+class RPModelPointEstimator:
 
-            try:
-                model = self.get_gene_model(symbol)
-                weights = self.get_gene_weights(model, cell_topic_distribution)
+    def __init__(self, gene_symbol, *,a_up, a_down, a_promoter, distance_up, distance_down, dropout, theta, b,
+            upstream_mask, downstream_mask, promoter_mask, region_distances, region_mask, region_score_map):
 
-                data.append((model, weights, expr_matrix[:,i], read_depth))
-            except Exception as err:
-                logger.error(symbol + ': ' + str(repr(err)))
+        self.a_up = a_up
+        self.a_down = a_down
+        self.a_promoter = a_promoter
+        self.distance_up = distance_up
+        self.distance_down = distance_down
+        self.dropout = dropout
+        self.theta = theta
+        self.b = b
 
-        logger.info('Compiled {} models.'.format(len(data)))
-        logger.info('Parallelizing training ...')
-        fit_models = Parallel(n_jobs= n_jobs, verbose=10)([
-            delayed(train_fn)(gene_data) for gene_data in data
+        self.upstream_mask = upstream_mask
+        self.downstream_mask = downstream_mask
+        self.promoter_mask = promoter_mask
+        self.region_distances = region_distances
+        self.region_mask = region_mask
+        self.region_score_map = region_score_map
+
+    def get_log_expr_rate(self, region_weights, return_components = False):
+
+        upstream_weights = region_weights[:,  self.upstream_mask ]
+        downstream_weights = region_weights[:, self.downstream_mask ]
+        promoter_weights = region_weights[:, self.promoter_mask ]
+
+        upstream_distances = self.region_distances[self.upstream_mask]
+        downstream_distances = self.region_distances[self.downstream_mask]
+
+        upstream_effects = 1e4 * self.a_up * np.sum(upstream_weights * np.power(0.5, upstream_distances/ (1e3 * np.exp(self.distance_up)) ), axis = 1)
+        downstream_effects = 1e4 * self.a_down * np.sum(downstream_weights * np.power(0.5, downstream_distances/ (1e3 * np.exp(self.distance_down))), axis = 1)
+        promoter_effects = 1e4 * self.a_promoter * np.sum(promoter_weights, axis = 1)
+        
+        lam = upstream_effects + promoter_effects + downstream_effects + self.b
+
+        if return_components:
+            return lam, upstream_effects, promoter_effects, downstream_effects
+        else:
+            return lam
+
+    def sample_expression(self, region_weights, cell_read_depth, n_samples = 500):
+
+        expr_rate = np.exp(self.get_log_expr_rate(region_weights))
+
+        return pm.ZeroInflatedNegativeBinomial.dist(mu = cell_read_depth * expr_rate, alpha = self.theta, psi = self.dropout).sample(n_samples)
+
+    def posterior_ISD(self, reg_state, motif_hits):
+
+        assert(motif_hits.shape[1] == reg_state.shape[0])
+        assert(len(reg_state.shape) == 1)
+
+        reg_state = reg_state[self.region_score_map][self.region_mask][np.newaxis, :]
+
+        motif_hits = np.array(motif_hits[:,self.region_score_map][:, self.region_mask].todense())
+
+        isd_mask = np.maximum(1 - motif_hits, 0)
+
+        isd_states = np.vstack((reg_state, reg_state * isd_mask))
+
+        rp_scores = np.exp(self.get_log_expr_rate(isd_states))
+
+        return rp_scores[1:], rp_scores[0]
+
+  
+
+class RPModel:
+
+    batch_size = 128
+    var_names = []
+
+    def __init__(self, gene_symbol, *, region_mask, region_distances, upstream_mask, downstream_mask, promoter_mask, user_to_model_region_map):
+
+        self.gene_symbol = gene_symbol
+        self.region_mask = region_mask
+        self.upstream_mask = upstream_mask
+        self.downstream_mask = downstream_mask
+        self.promoter_mask = promoter_mask
+        self.region_distances = region_distances
+        self.is_fit = False
+        self.region_score_map = user_to_model_region_map
+
+    def summarize_trace(self, model, trace, metric = np.mean):
+
+        summary = dict()
+        with model:
+            #summary['posterior_summary'] = az.summary(trace, var_names = ['a','b','theta','log_distance']).to_dict()
+            for var in  self.var_names:
+                summary[var] = metric(trace[var], axis = 0).tolist()
+                self.__setattr__(var, np.array(summary[var]))
+                summary[var + '_samples'] = trace[var].tolist()
+
+        summary['log_rate_expr_samples'] = self.infer(num_samples=100).tolist()
+
+        return summary
+
+    def write_summary(self, filename):
+
+        with open(filename, 'w') as f:
+            json.dump(self.summary, f)
+
+    def load_summary(self, filename):
+
+        with open(filename, 'r') as f:
+            self.summary = json.load(f)
+
+        for param in self.var_names:
+            self.__setattr__(param, np.array(self.summary[param]))
+            self.summary[param + "_samples"] = np.array(self.summary[param + "_samples"])
+
+        self.summary['log_rate_expr_samples'] = np.array(self.summary['log_rate_expr_samples']).mean(axis = 0)
+
+    def fit(self,*, weights, expression, read_depth, topic_distribution, method = 'advi', progressbar=True, posterior_samples = 500, n_steps = 200000):
+
+        expression = np.array(expression).astype(np.float64)
+        read_depth = np.array(read_depth).astype(np.int64)
+        weights = np.array(weights).astype(np.float64)
+
+        #assert(expression.shape[0] == read_depth.shape[0] == weights.shape[0])
+        #assert(len(expression.shape) == 1)
+        #assert(len(read_depth.shape) == 1)
+        #assert(self.region_distances.shape == (weights.shape[1],))
+        #assert(len(weights.shape) == 2)
+        #assert(weights.shape[1] == len(self.region_distances))
+        
+        logging.info('Building model ...')
+        self.model = self.make_model(weights = weights, expression = expression,
+            read_depth = read_depth, topic_distribution = topic_distribution)
+            
+        logging.info('Training ...')
+        with self.model:
+            self.mean_field = pm.fit(n_steps, method=method, progressbar = progressbar,
+                callbacks = [CheckParametersConvergence(every=100, tolerance=0.001,diff='relative')])
+
+            self.trace = self.mean_field.sample(posterior_samples)
+
+        self.summary = self.summarize_trace(self.model, self.trace)
+
+        return self
+
+    def infer(self, num_samples = 300):
+        return self.sample_node(self.model, self.log_rate_expr, num_samples=num_samples)
+
+    def get_rp_function(self):
+
+        return RPModelPointEstimator(self.gene_symbol,
+            a_up = self.a[0],
+            a_down = self.a[1],
+            a_promoter = self.a[2],
+            distance_up = self.log_distance[0],
+            distance_down = self.log_distance[1],
+            dropout = self.dropout,
+            theta = self.theta,
+            b = self.b,
+            **self.get_rp_function_kwargs()
+        )
+
+    def get_rp_function_kwargs(self):
+        return dict(
+            upstream_mask = self.upstream_mask,
+            downstream_mask = self.downstream_mask,
+            promoter_mask = self.promoter_mask,
+            region_distances = self.region_distances,
+            region_mask = self.region_mask,
+            region_score_map = self.region_score_map
+        )
+
+
+class TransEffectModel(RPModel):
+
+    var_names = ['beta','b','dropout','theta']
+    batch_size = 64
+
+    def __init__(self):
+        pass
+
+    def get_rp_function():
+        raise NotImplementedError()
+
+    def make_model(self,*, weights, topic_distribution, expression, read_depth):
+
+        K = topic_distribution.shape[-1]
+        N,G = expression.shape
+        
+        self.mixing_weights = pm.Minibatch(topic_distribution, batch_size=self.batch_size)
+        self.read_depth_batches = pm.Minibatch(read_depth[:,np.newaxis].copy(), batch_size=self.batch_size)
+        self.expression_batches = pm.Minibatch(expression, batch_size=self.batch_size)
+        
+        with pm.Model() as model:
+
+            beta = pm.Gamma('beta', alpha = 1, beta = 1, shape = (K,G))
+
+            b = pm.Normal('b', mu = 0, sigma = 100, shape = (1,G))
+
+            self.log_rate_expr = tt.dot(self.mixing_weights, beta) + b # (N,K) * (K,G) + (1,G) -> (N,G)
+
+            dropout = pm.Beta('dropout', alpha = 1, beta = 10, testval = 0.2, shape = (1,G))
+
+            dispersion = pm.Gamma('theta', alpha = 2, beta = 2, testval = 2, shape = (1,G))
+            
+            X = pm.ZeroInflatedNegativeBinomial('expr', mu = tt.addbroadcast(self.read_depth_batches, 1) * tt.exp(self.log_rate_expr), psi = dropout, 
+                            alpha = dispersion, observed = self.expression_batches, total_size = N)
+            
+        return model
+
+    def sample_node(self, model, node, num_samples = 300):
+        with model:
+            return self.mean_field.sample_node(node, 
+                    more_replacements={
+                        self.read_depth_batches.minibatch : self.read_depth_batches.shared,
+                        self.mixing_weights.minibatch : self.mixing_weights.shared,
+                        self.expression_batches.minibatch : self.expression_batches.shared
+                    }, size = num_samples).eval()
+
+    def get_log_expr_rate(self, topic_distribution, region_weights):
+
+        return np.dot(topic_distribution, self.beta) + self.b
+
+
+class TopicMixtureRPModel(RPModel):
+
+    batch_size = 128
+    var_names = ['a','b','theta','log_distance','a_hyper','tau','dropout']
+
+    def make_model(self,*, weights, topic_distribution, expression, read_depth):
+
+        self.K = topic_distribution.shape[1]
+        N = weights.shape[0]
+
+        upstream_distances = self.region_distances[self.upstream_mask]
+        downstream_distances = self.region_distances[self.downstream_mask]
+
+        self.upstream_batches, self.downstream_batches, self.promoter_batches, self.expression_batches, self.read_depth_batches = \
+            pm.Minibatch(weights[:,  self.upstream_mask ].copy(), self.batch_size), pm.Minibatch(weights[:, self.downstream_mask ].copy(), self.batch_size), \
+            pm.Minibatch(weights[:, self.promoter_mask ].copy(), self.batch_size), pm.Minibatch(expression, self.batch_size), pm.Minibatch(read_depth, self.batch_size)
+
+        self.mixing_weights = pm.Minibatch(topic_distribution, self.batch_size)
+
+        #def RP(reg_state, region_distance, decay):
+        #    N, D = reg_state.shape
+        #    return tt.sum(reg_state.reshape((N,D,1)) * tt.power(0.5, region_distance.reshape((1,-1, 1)) / (1e3 * tt.exp( decay.reshape((1,1,-1))))), axis = 1)
+
+        def RP(w, d, l):
+            return tt.sum(w * tt.power(0.5, d.reshape((1,-1)) / (1e3 * tt.exp(l)) ), axis = 1).reshape((-1,1))
+
+        with pm.Model() as model:
+            
+            d = pm.Normal('log_distance', mu = np.e, sigma = 2, shape = 2, testval=np.e)
+
+            a_hyper = pm.HalfNormal('a_hyper', sigma = 12, shape = (3,1))
+            tau = pm.Gamma('tau', alpha = 1, beta = 5, shape = (3,1))
+            a = pm.TruncatedNormal('a', sigma = tau, mu = a_hyper, shape = (3,self.K), lower = 0)
+            
+            b = pm.Normal('b', sigma = 15, mu = 0, shape = 1, testval=-10)
+
+            theta = pm.Gamma('theta', alpha = 2, beta = 1/2, shape = 1, testval = 2)
+
+            rp_upstream = 1e4 * a[0,:] * RP(self.upstream_batches, upstream_distances, d[0]) # n,K
+            rp_downstream = 1e4 * a[1,:] * RP(self.downstream_batches, downstream_distances, d[1])
+            rp_promoter = 1e4 * a[2,:] * tt.sum(self.promoter_batches, axis = 1).reshape((-1,1))
+            
+            self.log_rate_expr = tt.sum((rp_upstream + rp_promoter + rp_downstream) * self.mixing_weights, axis = 1) + b
+            
+            dropout = pm.Beta('dropout', alpha = 1, beta = 10)
+                
+            X = pm.ZeroInflatedNegativeBinomial('expr', mu = self.read_depth_batches * tt.exp(self.log_rate_expr), psi = dropout,
+                            alpha = theta, observed = self.expression_batches, total_size = N)
+
+        return model
+
+    def sample_node(self, model, node, num_samples = 300):
+        with model:
+            return self.mean_field.sample_node(node, 
+                    more_replacements={
+                        self.upstream_batches.minibatch : self.upstream_batches.shared,
+                        self.downstream_batches.minibatch : self.downstream_batches.shared,
+                        self.promoter_batches.minibatch : self.promoter_batches.shared,
+                        self.read_depth_batches.minibatch : self.read_depth_batches.shared,
+                        self.mixing_weights.minibatch : self.mixing_weights.shared,
+                        self.expression_batches.minibatch : self.expression_batches.shared
+                    }, size = num_samples).eval()
+
+    def get_log_expr_rate(self, topic_distribution, region_weights):
+
+        unmixed_log_rate = np.hstack([
+            self.get_topic_level_function(i, b = 0).get_log_expr_rate(region_weights)[:,np.newaxis] for i in range(topic_distribution.shape[-1])
         ])
 
-        return fit_models
+        return (unmixed_log_rate * topic_distribution).sum(axis = 1) + self.b
+
+
+    def sample_rp_from_hyperprior(self, region_weights):
+
+        estimated_epxr = []
+        for i in range(self.summary['a_hyper_samples'].shape[0]):
+
+            a_samples = self.summary['a_hyper_samples'][i,:,0]
+            estimated_epxr.append(
+                RPModelPointEstimator(self.gene_symbol,
+                    a_up = a_samples[0],
+                    a_down = a_samples[1],
+                    a_promoter = a_samples[2],
+                    distance_up = self.log_distance[0],
+                    distance_down = self.log_distance[1],
+                    dropout = self.dropout,
+                    theta = self.theta,
+                    b = self.b,
+                    **self.get_rp_function_kwargs()
+                ).get_log_expr_rate(region_weights)[:,np.newaxis]
+            )
+
+        return np.hstack(estimated_epxr).mean(axis = 1)
+
+
+    def get_hyperprior_function(self):
+
+        return RPModelPointEstimator(self.gene_symbol,
+            a_up = self.a_hyper[0][0],
+            a_down = self.a_hyper[1][0],
+            a_promoter = self.a_hyper[2][0],
+            distance_up = self.log_distance[0],
+            distance_down = self.log_distance[1],
+            dropout = self.dropout,
+            theta = self.theta,
+            b = self.b,
+            **self.get_rp_function_kwargs()
+        )
+
+    def get_topic_level_function(self, topic_num, b = None):
+
+        return RPModelPointEstimator(self.gene_symbol,
+            a_up = self.a[0][topic_num],
+            a_down = self.a[1][topic_num],
+            a_promoter = self.a[2][topic_num],
+            distance_up = self.log_distance[0],
+            distance_down = self.log_distance[1],
+            dropout = self.dropout,
+            theta = self.theta,
+            b = self.b if b is None else b,
+            **self.get_rp_function_kwargs(),
+        )
+
+
+class AssymetricalRPModelVI(RPModel):
+
+    batch_size = 256
+    var_names = ['a','b','theta','log_distance','dropout']
+
+    #____ MODEL TRAINING _____
+    def make_model(self,*, weights, topic_distribution, expression, read_depth):
+
+        def RP(w, d, l):
+            return tt.sum(w * tt.power(0.5, d.reshape((1,-1)) / (1e3 * tt.exp(l)) ), axis = 1).reshape((-1,))
+
+        upstream_distances = self.region_distances[self.upstream_mask]
+        downstream_distances = self.region_distances[self.downstream_mask]
+
+        self.upstream_batches, self.downstream_batches, self.promoter_batches, self.expression_batches, self.read_depth_batches = \
+            pm.Minibatch(weights[:,  self.upstream_mask ].copy(), self.batch_size), pm.Minibatch(weights[:, self.downstream_mask ].copy(), self.batch_size), \
+            pm.Minibatch(weights[:, self.promoter_mask ].copy(), self.batch_size), pm.Minibatch(expression, self.batch_size), pm.Minibatch(read_depth, self.batch_size)
+
+        with pm.Model() as model:
+            
+            d = pm.Normal('log_distance', mu = np.e, sigma = 2, shape = 2, testval=np.e)
+            
+            pm.Deterministic('distance', tt.exp(d))
+            
+            a = pm.HalfNormal('a', sigma=12, shape = 3, testval = 10)
+            b = pm.Normal('b', sigma = 15, mu = 0, shape = 1, testval=-10)
+            
+            theta = pm.Gamma('theta', alpha = 2, beta = 1/2, shape = 1, testval = 2)
+            
+            rp_upstream = 1e4 * a[0] * RP(self.upstream_batches, upstream_distances, d[0])
+            rp_downstream = 1e4 * a[1] * RP(self.downstream_batches, downstream_distances, d[1])
+            rp_promoter = 1e4 * a[2] * tt.sum(self.promoter_batches, axis = 1).reshape((-1,))
+            
+            self.log_rate_expr = rp_upstream + rp_promoter + rp_downstream + b
+            
+            dropout = pm.Beta('dropout', alpha = 1, beta = 10)
+                
+            X = pm.ZeroInflatedNegativeBinomial('expr', mu = self.read_depth_batches * tt.exp(self.log_rate_expr), psi = dropout,
+                            alpha = theta, observed = self.expression_batches, total_size = len(expression))
+
+        return model
+
+    def sample_node(self, model, node, num_samples = 300):
+        with model:
+            return self.mean_field.sample_node(node, 
+                    more_replacements={
+                        self.upstream_batches.minibatch : self.upstream_batches.shared,
+                        self.downstream_batches.minibatch : self.downstream_batches.shared,
+                        self.promoter_batches.minibatch : self.promoter_batches.shared,
+                        self.read_depth_batches.minibatch : self.read_depth_batches.shared,
+                        self.expression_batches.minibatch : self.expression_batches.shared
+                    }, size = num_samples).eval()
+
+    def get_log_expr_rate(self, topic_distribution, region_weights):
+        return self.get_rp_function().get_log_expr_rate(region_weights)
+
+
+class TopicAdjustmentModel(RPModel):
+
+    batch_size = 256
+    var_names = ['a','b','theta','log_distance','dropout','beta']
+
+    #____ MODEL TRAINING _____
+    def make_model(self,*, weights, topic_distribution, expression, read_depth):
+
+        def RP(w, d, l):
+            return tt.sum(w * tt.power(0.5, d.reshape((1,-1)) / (1e3 * tt.exp(l)) ), axis = 1).reshape((-1,))
+
+        K = topic_distribution.shape[1]
+
+        upstream_distances = self.region_distances[self.upstream_mask]
+        downstream_distances = self.region_distances[self.downstream_mask]
+
+        self.upstream_batches, self.downstream_batches, self.promoter_batches, self.expression_batches, self.read_depth_batches = \
+            pm.Minibatch(weights[:,  self.upstream_mask ].copy(), self.batch_size), pm.Minibatch(weights[:, self.downstream_mask ].copy(), self.batch_size), \
+            pm.Minibatch(weights[:, self.promoter_mask ].copy(), self.batch_size), pm.Minibatch(expression, self.batch_size), pm.Minibatch(read_depth, self.batch_size)
+
+        self.topic_weight_batches = pm.Minibatch(clr_transform(topic_distribution).copy(), self.batch_size)
+
+        with pm.Model() as model:
+            
+            d = pm.Normal('log_distance', mu = np.e, sigma = 2, shape = 2, testval=np.e)
+            
+            pm.Deterministic('distance', tt.exp(d))
+            
+            a = pm.HalfNormal('a', sigma=12, shape = 3, testval = 10)
+            #a = pm.Gamma('a', alpha = 1, beta = 1/10, testval = 10, shape = 3)
+            b = pm.Normal('b', sigma = 15, mu = 0, shape = 1, testval=-10)
+            
+            theta = pm.Gamma('theta', alpha = 2, beta = 1/2, shape = 1, testval = 2)
+            
+            rp_upstream = 1e4 * a[0] * RP(self.upstream_batches, upstream_distances, d[0])
+            rp_downstream = 1e4 * a[1] * RP(self.downstream_batches, downstream_distances, d[1])
+            rp_promoter = 1e4 * a[2] * tt.sum(self.promoter_batches, axis = 1).reshape((-1,))
+
+            beta = pm.Laplace('beta', mu = 0, b = 1/10, shape = (K,1), testval=0.01)
+
+            self.log_rate_expr = rp_upstream + rp_promoter + rp_downstream + tt.reshape(tt.dot(self.topic_weight_batches, beta), (-1,)) + b
+
+            dropout = pm.Beta('dropout', alpha = 1, beta = 10)
+                
+            X = pm.ZeroInflatedNegativeBinomial('expr', mu = self.read_depth_batches * tt.exp(self.log_rate_expr), psi = dropout,
+                            alpha = theta, observed = self.expression_batches, total_size = len(expression))
+
+        return model
+
+    def sample_node(self, model, node, num_samples = 300):
+        with model:
+            return self.mean_field.sample_node(node, 
+                    more_replacements={
+                        self.upstream_batches.minibatch : self.upstream_batches.shared,
+                        self.downstream_batches.minibatch : self.downstream_batches.shared,
+                        self.promoter_batches.minibatch : self.promoter_batches.shared,
+                        self.read_depth_batches.minibatch : self.read_depth_batches.shared,
+                        self.expression_batches.minibatch : self.expression_batches.shared,
+                        self.topic_weight_batches.minibatch : self.topic_weight_batches.shared,
+                    }, size = num_samples).eval()
+
+    def get_log_expr_rate(self, topic_distribution, region_weights):
+        return self.get_rp_function().get_log_expr_rate(region_weights) + np.dot(clr_transform(topic_distribution), self.beta).reshape(-1)
+
+
+'''class ConvergenceError(Exception):
+    pass
 
 class AssymetricalRPModel:
 
@@ -243,155 +749,6 @@ class AssymetricalRPModel:
         draws = pm.NegativeBinomial.dist(mu = cell_read_depth * lambd, alpha = self.theta[0]).random(size = draws_per_sample)
 
         return draws
-
-
-    def posterior_ISD(self, reg_state, motif_hits):
-
-        assert(motif_hits.shape[1] == reg_state.shape[0])
-        assert(len(reg_state.shape) == 1)
-
-        reg_state = reg_state[self.region_score_map][self.region_mask][np.newaxis, :]
-
-        motif_hits = np.array(motif_hits[:,self.region_score_map][:, self.region_mask].todense())
-
-        isd_mask = np.maximum(1 - motif_hits, 0)
-
-        isd_states = np.vstack((reg_state, reg_state * isd_mask))
-
-        _, upstream, promoter, downstream = self.compute_lambda_mean_posterior(isd_states, return_components=True)
-
-        rp_scores = upstream + promoter + downstream
-
-        return np.sqrt(1 - rp_scores[1:]/rp_scores[0])
-
-class ConvergenceError(Exception):
-    pass
-
-class AssymetricalRPModelVI(AssymetricalRPModel):
-
-    batch_size = 256
-    var_names = ['a','b','theta','log_distance']
-
-    #____ MODEL TRAINING _____
-    def make_model(self, weights, expression, read_depth):
-
-        def RP(w, d, l):
-            return tt.sum(w * tt.power(0.5, d.reshape((1,-1)) / (1e3 * tt.exp(l)) ), axis = 1).reshape((-1,))
-
-        upstream_distances = self.region_distances[self.upstream_mask]
-        downstream_distances = self.region_distances[self.downstream_mask]
-
-        upstream_batches, downstream_batches, promoter_batches, expression_batches, read_depth_batches = \
-            pm.Minibatch(weights[:,  self.upstream_mask ].copy(), self.batch_size), pm.Minibatch(weights[:, self.downstream_mask ].copy(), self.batch_size), \
-            pm.Minibatch(weights[:, self.promoter_mask ].copy(), self.batch_size), pm.Minibatch(expression, self.batch_size), pm.Minibatch(read_depth, self.batch_size)
-
-        logger.debug('Upstream weights shape: ' + str(weights[:,  self.upstream_mask ].copy().shape))
-        logger.debug('Downstream weights shape: ' + str(weights[:,  self.downstream_mask ].copy().shape))
-        logger.debug('Upstream weights shape: ' + str(weights[:,  self.promoter_mask].copy().shape))
-        logger.debug('Batch size: ' + str(self.batch_size))
-
-        with pm.Model() as model:
-            
-            d = pm.Normal('log_distance', mu = np.e, sigma = 1, shape = 2, testval=np.e)
-            
-            pm.Deterministic('distance', tt.exp(d))
-            
-            a = pm.HalfNormal('a', sigma=10000, shape = 3, testval = 1e3)
-            b = pm.Normal('b', sigma = 15, mu = 0, shape = 1, testval=-10)
-            
-            theta = pm.Gamma('theta', alpha = 2, beta = 2, shape = 1, testval = 2)
-            
-            rp_upstream = a[0] * RP(upstream_batches, upstream_distances, d[0])
-            rp_downstream = a[1] * RP(downstream_batches, downstream_distances, d[1])
-            rp_promoter = a[2] * tt.sum(promoter_batches, axis = 1).reshape((-1,))
-            
-            log_rate_expr = rp_upstream + rp_promoter + rp_downstream + b
-            
-            # Sample observed gene expression
-            X = pm.NegativeBinomial('expr', mu = read_depth_batches * tt.exp(log_rate_expr), alpha = theta, 
-                observed = expression_batches, total_size = len(expression))
-
-        return model
-
-
-    def summarize_trace(self, model, trace, metric = np.mean):
-
-        summary = dict()
-        with model:
-            #summary['posterior_summary'] = az.summary(trace, var_names = ['a','b','theta','log_distance']).to_dict()
-            for var in  self.var_names:
-                summary[var] = metric(trace[var], axis = 0).tolist()
-
-                summary[var + '_samples'] = trace[var].tolist()
-
-        return summary
-
-    def write_summary(self, filename):
-
-        with open(filename, 'w') as f:
-            json.dump(self.summary, f)
-
-    def load_summary(self, filename):
-
-        with open(filename, 'r') as f:
-            self.summary = json.load(f)
-
-        for param in self.var_names:
-            self.__setattr__(param, self.summary[param])
-
-
-    def fit(self, weights, expression, read_depth, method = 'advi', progressbar=True):
-
-        expression = np.array(expression).astype(np.float64)
-        read_depth = np.array(read_depth).astype(np.int64)
-        weights = np.array(weights).astype(np.float64)
-
-        assert(expression.shape[0] == read_depth.shape[0] == weights.shape[0])
-        assert(len(expression.shape) == 1)
-        assert(len(read_depth.shape) == 1)
-        assert(self.region_distances.shape == (weights.shape[1],))
-        assert(len(weights.shape) == 2)
-        assert(weights.shape[1] == len(self.region_distances))
-        
-        logging.info('Building model ...')
-        self.model = self.make_model(weights, expression, read_depth)
-            
-        logging.info('Training ...')
-        with self.model:
-            mean_field = pm.fit(200000, method=method, progressbar = progressbar,
-                callbacks = [CheckParametersConvergence(every=100, tolerance=0.001,diff='relative')])
-
-            self.trace = mean_field.sample(500)
-
-        self.summary = self.summarize_trace(self.model, self.trace)
-
-        for param in self.var_names:
-            self.__setattr__(param, self.summary[param])
-
-        return self
-
-    def compute_lambda_mean_posterior(self, region_weights, return_components = False):
-
-        upstream_weights = region_weights[:,  self.upstream_mask ]
-        downstream_weights = region_weights[:, self.downstream_mask ]
-        promoter_weights = region_weights[:, self.promoter_mask ]
-
-        upstream_distances = self.region_distances[self.upstream_mask]
-        downstream_distances = self.region_distances[self.downstream_mask]
-
-        a, d, b = self.a, self.log_distance, self.b
-
-        upstream_effects = a[0] * np.sum(upstream_weights * np.power(0.5, upstream_distances/ (1e3 * np.exp(d[0])) ), axis = 1)
-        downstream_effects = a[1] * np.sum(downstream_weights * np.power(0.5, downstream_distances/ (1e3 * np.exp(d[1]))), axis = 1)
-        promoter_effects = a[2] * np.sum(promoter_weights, axis = 1)
-        
-        lam = np.exp(upstream_effects + promoter_effects + downstream_effects + b[0])
-
-        if return_components:
-            return lam, upstream_effects, promoter_effects, downstream_effects
-        else:
-            return lam
-        
     
 class AssymetricalRPModelMAP(AssymetricalRPModel):
 
@@ -590,11 +947,11 @@ class AssymetricalRPModelMCMC(AssymetricalRPModel):
 
         vals, bins = np.histogram(self.phi, bins = np.linspace(0,1,num_bins+1))
 
-        return vals/len(self.phi)
+        return vals/len(self.phi)'''
 
 
 def main(*,genes_file, species, peaks_file, read_depth_array, expr_matrix, cell_topic_distribution_matrix, 
-    region_topic_distribution_matrix, n_jobs = -1, file_prefix='./'):
+    region_topic_distribution_matrix, n_jobs = -1, file_prefix='./', start_idx = 0, end_idx = None, type = 'VI'):
 
     peaks, _ = parse_regions_file(peaks_file)
 
@@ -606,17 +963,20 @@ def main(*,genes_file, species, peaks_file, read_depth_array, expr_matrix, cell_
     with open(genes_file, 'r') as f:
         genes = [x.strip().upper() for x in f.readlines()]
 
-    TopicRPFeatureFactory.fit_models(
-        genes = genes,
+    results = TopicRPFeatureFactory.fit_models(
+        genes = genes[int(start_idx) : int(end_idx) if not end_idx is None else None],
         peaks = peaks,
         species = species,
         read_depth = read_depth,
         region_topic_distribution = region_topic_distribution,
         cell_topic_distribution = cell_topic_distribution,
-        expr_matrix = expr,
-        n_jobs= n_jobs,
-        file_prefix= file_prefix
+        expr_matrix = expr[:,start_idx:end_idx],
+        n_jobs= int(n_jobs),
+        file_prefix= file_prefix,
+        type = type,
     )
+
+    print('\n'.join(map(str, results)))
 
 if __name__ == "__main__":
     fire.Fire(main)
