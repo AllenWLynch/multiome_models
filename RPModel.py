@@ -102,6 +102,8 @@ class TopicRPFeatureFactory:
 
     def train_gene_models(self, gene_symbols,*,cell_topic_distribution, expr_matrix, read_depth, n_jobs = -1, 
         file_prefix='./', type = 'TopicMixture', save_model = False):
+        
+        logging.info(type)
 
         if not type == 'TransEffect':
 
@@ -110,7 +112,7 @@ class TopicRPFeatureFactory:
                 
                 try:
                     model.fit(**args[1], method = 'advi', progressbar=False)
-                    model.write_summary(file_prefix + model.gene_symbol + '_expr.json')
+                    model.write_summary(file_prefix + model.gene_symbol + '_summary.json')
 
                     if save_model:
                         with open(file_prefix + model.gene_symbol + '_model.pkl', 'wb') as f:
@@ -166,8 +168,8 @@ class TopicRPFeatureFactory:
                 posterior_samples=100,
             )
 
-            with open(file_prefix + 'trans-effect' + '_model.pkl', 'wb') as f:
-                pickle.dump(model, f)
+            with open(file_prefix + 'trans-effect' + '_trace.pkl', 'wb') as f:
+                pickle.dump(model.trace, f)
 
             return ['Done!',]
 
@@ -306,6 +308,7 @@ class RPModel:
             self.mean_field = pm.fit(n_steps, method=method, progressbar = progressbar,
                 callbacks = [CheckParametersConvergence(every=100, tolerance=0.001,diff='relative')])
 
+            logging.info('Sampling posterior ...')
             self.trace = self.mean_field.sample(posterior_samples)
 
         self.summary = self.summarize_trace(self.model, self.trace)
@@ -347,6 +350,9 @@ class TransEffectModel(RPModel):
 
     def __init__(self):
         pass
+
+    def summarize_trace(self, *args, **kwargs):
+        return None
 
     def get_rp_function():
         raise NotImplementedError()
