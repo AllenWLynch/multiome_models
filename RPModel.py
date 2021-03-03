@@ -112,7 +112,7 @@ class TopicRPFeatureFactory:
                 
                 try:
                     model.fit(**args[1], method = 'advi', progressbar=False)
-                    model.write_summary(file_prefix + model.gene_symbol + '_summary.json')
+                    model.write_trace(file_prefix + model.gene_symbol + '_trace.pkl')
 
                     if save_model:
                         with open(file_prefix + model.gene_symbol + '_model.pkl', 'wb') as f:
@@ -168,8 +168,7 @@ class TopicRPFeatureFactory:
                 posterior_samples=100,
             )
 
-            with open(file_prefix + 'trans-effect' + '_trace.pkl', 'wb') as f:
-                pickle.dump(model.trace, f)
+            model.write_trace(file_prefix + 'trans-effect' + '_trace.pkl', 'wb')
 
             return ['Done!',]
 
@@ -238,8 +237,6 @@ class RPModelPointEstimator:
 
         return rp_scores[1:], rp_scores[0]
 
-  
-
 class RPModel:
 
     batch_size = 128
@@ -269,6 +266,20 @@ class RPModel:
         summary['log_rate_expr_samples'] = self.infer(num_samples=100).tolist()
 
         return summary
+    
+    def write_trace(self, filename):
+        with open(filename, 'wb') as f:
+            pickle.dump(self.trace, f)
+
+    def load_trace(self, filename):
+        with open(filename, 'rb') as f:
+            self.trace = pickle.load(f)
+
+        self.summarize_params(self.trace)
+
+    def summarize_params(self, trace, metric = np.mean):
+        for param in self.var_names:
+            self.__setattr__(param, metric(trace[param], axis = 0))
 
     def write_summary(self, filename):
 
@@ -286,7 +297,7 @@ class RPModel:
 
         self.summary['log_rate_expr_samples'] = np.array(self.summary['log_rate_expr_samples']).mean(axis = 0)
 
-    def fit(self,*, weights, expression, read_depth, topic_distribution, method = 'advi', progressbar=True, posterior_samples = 500, n_steps = 200000):
+    def fit(self,*, weights, expression, read_depth, topic_distribution, method = 'advi', progressbar=True, posterior_samples = 200, n_steps = 200000):
 
         expression = np.array(expression).astype(np.float64)
         read_depth = np.array(read_depth).astype(np.int64)
@@ -311,7 +322,8 @@ class RPModel:
             logging.info('Sampling posterior ...')
             self.trace = self.mean_field.sample(posterior_samples)
 
-        self.summary = self.summarize_trace(self.model, self.trace)
+        #self.summary = self.summarize_trace(self.model, self.trace)
+        self.summarize_params(self.trace)
 
         return self
 
@@ -376,7 +388,7 @@ class TransEffectModel(RPModel):
 
             dropout = pm.Beta('dropout', alpha = 1, beta = 10, testval = 0.2, shape = (1,G))
 
-            dispersion = pm.Gamma('theta', alpha = 2, beta = 2, testval = 2, shape = (1,G))
+            dispersion = pm.Gamma('theta', alpha = 2, beta = 1/2, testval = 2, shape = (1,G))
             
             X = pm.ZeroInflatedNegativeBinomial('expr', mu = tt.addbroadcast(self.read_depth_batches, 1) * tt.exp(self.log_rate_expr), psi = dropout, 
                             alpha = dispersion, observed = self.expression_batches, total_size = N)

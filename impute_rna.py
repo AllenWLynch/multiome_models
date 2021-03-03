@@ -2,7 +2,7 @@ import anndata
 import scanpy as sc
 import numpy as np
 import argparse
-import breakpointer
+import markov_diffuser
 import sys
 import fire
 from scipy import sparse
@@ -116,13 +116,13 @@ def main(data_path, save_path, min_cells = 10, min_genes = 200, num_variable_gen
     rna_data.obsm['rna_pca'] = rna_data.obsm['X_pca'][:,1:]
 
     print('Calculating Markov matrix ...', file = sys.stderr)
-    markov_matrix = breakpointer.calc_markov_diffusion_matrix(
+    markov_matrix = markov_diffuser.calc_markov_diffusion_matrix(
                     rna_data.obsm['rna_pca'],
                     ka = ka, neighborhood_size= neighborhood_size, diffusion_time=diffusion_time
                 )
 
     print('Imputing gene expression matrix ...', file = sys.stderr)
-    rna_data.layers['imputed'] = breakpointer.impute(
+    rna_data.layers['imputed'] = markov_diffuser.impute(
                 rna_data.X, 
                 markov_matrix
             )
