@@ -275,7 +275,7 @@ class RPModel:
         else:
             trace = {var : self.trace[var] for var in self.var_names}
             with open(filename, 'wb') as f:
-                pickle.dump(self.trace, f)
+                pickle.dump(trace, f)
 
     def load_trace(self, filename):
 
