@@ -267,11 +267,18 @@ class RPModel:
 
         return summary
     
-    def write_trace(self, filename):
-        with open(filename, 'wb') as f:
-            pickle.dump(self.trace, f)
+    def write_trace(self, filename, full_object = False):
+
+        if full_object:
+            with open(filename, 'wb') as f:
+                pickle.dump(self.trace, f)
+        else:
+            trace = {var : self.trace[var] for var in self.var_names}
+            with open(filename, 'wb') as f:
+                pickle.dump(self.trace, f)
 
     def load_trace(self, filename):
+
         with open(filename, 'rb') as f:
             self.trace = pickle.load(f)
 
