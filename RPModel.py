@@ -102,37 +102,54 @@ class TopicRPFeatureFactory:
 
 
     def train_gene_models(self, gene_symbols,*,cell_topic_distribution, expr_matrix, read_depth, n_jobs = -1, 
-        file_prefix='./', type = 'TopicMixture', save_model = False):
+        file_prefix='./', type = 'VI'):
 
-        logging.info('Instantiating models ...')
-        train_data = []
-        for i, gene in enumerate(gene_symbols):
-            try:
-                new_model = self.get_gene_model(gene)
-                train_data.append((
-                    new_model,
-                    dict(
-                        weights = self.get_gene_weights(new_model, cell_topic_distribution),
-                        expression = expr_matrix[:, i],
-                        read_depth = read_depth
-                    )
-                ))
-            except IndexError:
-                logging.warning('Skipping ' + gene)
+        if type == 'VI':
 
-        def train_fn(model, fit_kwargs):
+            logging.info('Instantiating models ...')
+            train_data = []
+            for i, gene in enumerate(gene_symbols):
+                try:
+                    new_model = self.get_gene_model(gene)
+                    train_data.append((
+                        new_model,
+                        dict(
+                            weights = self.get_gene_weights(new_model, cell_topic_distribution),
+                            expression = expr_matrix[:, i],
+                            read_depth = read_depth
+                        )
+                    ))
+                except IndexError:
+                    logging.warning('Skipping ' + gene)
 
-            try:
-                model.fit(**fit_kwargs).write_trace(file_prefix + model.gene_symbol + '_trace.pkl')
-                return model.gene_symbol + ': Success'
+            def train_fn(model, fit_kwargs):
 
-            except Exception as err:
-                return model.gene_symbol + ': ' + str(repr(err))
-        
-        logging.info('Training ...')
-        return Parallel(n_jobs= n_jobs, verbose=10)([
-                    delayed(train_fn)(model, params) for model, params in train_data
-                ])
+                try:
+                    model.fit(**fit_kwargs).write_trace(file_prefix + model.gene_symbol + '_trace.pkl')
+                    return model.gene_symbol + ': Success'
+
+                except Exception as err:
+                    return model.gene_symbol + ': ' + str(repr(err))
+            
+            logging.info('Training ...')
+            return Parallel(n_jobs= n_jobs, verbose=10)([
+                        delayed(train_fn)(model, params) for model, params in train_data
+                    ])
+
+        elif type == 'TransEffect':
+
+            trans_model = TransEffectModel(gene_symbols).fit(
+                cell_topic_weights= cell_topic_distribution,
+                read_depth=read_depth,
+                gene_expr=expr_matrix
+            )
+
+            trans_model.write_trace(file_prefix + 'transeffect_trace.pkl')
+
+            return ['Done', ]
+
+        else:
+            raise ValueError('Model type {} does not exist'.format(str(type)))
 
 class RPModelPointEstimator:
 
@@ -198,31 +215,37 @@ class RPModelPointEstimator:
 
         return rp_scores[1:], rp_scores[0]
 
-class PyroRPVI(PyroModule):
-    
-    var_names = ['a','b','theta','dropout','logdistance']
-    
+
+class PyroModel(PyroModule):
+
+    var_names = []
+
+    def get_varnames(self):
+        return self.var_names
+
     @classmethod
-    def train(cls, name, gene_expr, init_kwargs, learning_rate = 0.01, iters = int(1e4)):
+    def train(cls, *init_args, learning_rate = 0.01, iters = int(1e4), **init_kwargs):
         
-        model = cls(name, **init_kwargs)
+        model = cls(*init_args, **init_kwargs)
         guide = AutoDiagonalNormal(model, init_loc_fn = init_to_mean)
         
-        adam = pyro.optim.Adam({"lr": 0.01})
+        adam = pyro.optim.Adam({"lr": learning_rate})
         svi = SVI(model, guide, adam, loss=Trace_ELBO())
 
         pyro.clear_param_store()
         for j in tqdm.tqdm(range(iters//100)):
             for i in range(100):
-                loss = svi.step(gene_expr)
+                loss = svi.step()
                 
         return model, guide
 
-    def get_varnames(self):
-        return [self.name + '_' + varname for varname in self.var_names]
 
+class PyroRPVI(PyroModel):
     
-    def __init__(self, gene_name, *,upstream_distances, downstream_distances, promoter_weights, upstream_weights, downstream_weights, read_depth):
+    var_names = ['a','b','theta','dropout','logdistance']
+    
+    def __init__(self, gene_name, *,upstream_distances, downstream_distances, promoter_weights, 
+            upstream_weights, downstream_weights, read_depth, gene_expr):
         super().__init__()
         self.upstream_distances = torch.tensor(upstream_distances)
         self.downstream_distances = torch.tensor(downstream_distances)
@@ -232,9 +255,12 @@ class PyroRPVI(PyroModule):
         self.read_depth = torch.tensor(read_depth)
         self.name = gene_name
         self.N = promoter_weights.shape[0]
-        
+        self.gene_expr = torch.tensor(gene_expr)
+
+    def get_varnames(self):
+        return [self.name + '_' + varname for varname in self.var_names]
     
-    def forward(self, gene_expr = None):
+    def forward(self):
 
         def RP(weights, distances, d):
             return 1e4 * (weights * torch.pow(0.5, distances/(1e3 * d))).sum(-1)
@@ -262,21 +288,64 @@ class PyroRPVI(PyroModule):
 
             pyro.sample(self.name +'_obs', 
                         dist.ZeroInflatedNegativeBinomial(total_count=theta, probs=p, gate = psi),
-                        obs= torch.tensor(gene_expr).index_select(0, ind) if not gene_expr is None else None)
+                        obs= self.gene_expr.index_select(0, ind))
 
-class RPModel:
 
-    def __init__(self, gene_symbol, *, region_mask, region_distances, upstream_mask, downstream_mask, promoter_mask, user_to_model_region_map):
+class PyroTransEffectModel(PyroModel):
 
-        self.gene_symbol = gene_symbol
-        self.region_mask = region_mask
-        self.upstream_mask = upstream_mask
-        self.downstream_mask = downstream_mask
-        self.promoter_mask = promoter_mask
-        self.region_distances = region_distances
-        self.is_fit = False
-        self.region_score_map = user_to_model_region_map
-    
+    var_names = ['beta','b','theta','dropout']
+
+    def __init__(self, gene_names, *, cell_topic_weights, read_depth, gene_expr):
+        super().__init__()
+        self.gene_names = gene_names
+        self.K = cell_topic_weights.shape[-1]
+        self.G = len(self.gene_names)
+        self.N = len(cell_topic_weights)
+        self.cell_topics = torch.tensor(cell_topic_weights)
+        self.read_depth = torch.tensor(read_depth)
+        self.gene_expr = torch.tensor(gene_expr)
+
+
+    def forward(self):
+
+        with pyro.plate("gene_weights", self.G):
+
+            b = pyro.sample("b", dist.Normal(-10.,3.))
+            theta = pyro.sample("theta", dist.Gamma(2., 0.5))
+            psi = pyro.sample("dropout", dist.Beta(1., 10.))
+
+            with pyro.plate("topic-gene_weights", self.K):
+                beta = pyro.sample("beta", dist.Gamma(1., 5.))        
+        
+        with pyro.plate("gene", self.G) as gene:
+            with pyro.plate("data", self.N, subsample_size=64) as ind:
+
+                expr_rate = pyro.deterministic("rate", torch.matmul(self.cell_topics.index_select(0, ind), beta) + b)
+
+                mu = torch.reshape(self.read_depth, (-1,1)).index_select(0, ind) * torch.exp(expr_rate)
+                p = torch.minimum(mu / (mu + theta), torch.tensor([0.99999]))
+
+                pyro.sample("obs",
+                            dist.ZeroInflatedNegativeBinomial(total_count=theta, 
+                                                              probs=p, gate = psi),
+                            obs= self.gene_expr.index_select(0, ind))
+
+class ExprModel:
+
+    def sample_posterior(self, num_samples = 200, attempts = 5):
+
+        for i in range(attempts):
+            try:
+
+                samples = Predictive(self.model, guide=self.guide, num_samples=num_samples,
+                                    return_sites=self.model.get_varnames())()
+                return {varname.split('_')[-1] : samples[varname].detach().numpy() for varname in self.model.get_varnames()}
+
+            except ValueError:
+                pass
+
+        raise ValueError('Posterior contains improper values')
+
     def write_trace(self, filename):
         with open(filename, 'wb') as f:
             pickle.dump(self.trace, f)
@@ -292,6 +361,24 @@ class RPModel:
         for param in self.trace.keys():
             self.__setattr__(param, metric(self.trace[param], axis = 0))
 
+    def get_log_expr_rate(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+class RPModel(ExprModel):
+
+    def __init__(self, gene_symbol, *, region_mask, region_distances, upstream_mask, downstream_mask, promoter_mask, user_to_model_region_map):
+
+        self.gene_symbol = gene_symbol
+        self.region_mask = region_mask
+        self.upstream_mask = upstream_mask
+        self.downstream_mask = downstream_mask
+        self.promoter_mask = promoter_mask
+        self.region_distances = region_distances
+        self.is_fit = False
+        self.region_score_map = user_to_model_region_map
+    
+
     def fit(self,*, weights, expression, read_depth, posterior_samples = 200):
 
         expression = np.array(expression).astype(np.float64)
@@ -300,33 +387,19 @@ class RPModel:
         
         self.model, self.guide = PyroRPVI.train(
             self.gene_symbol,
-            expression,
-            dict(upstream_distances = self.region_distances[self.upstream_mask], 
-                 downstream_distances = self.region_distances[self.downstream_mask], 
-                 promoter_weights = weights[:, self.promoter_mask], 
-                 upstream_weights = weights[:, self.upstream_mask], 
-                 downstream_weights = weights[:, self.downstream_mask], 
-                 read_depth = read_depth)
+            upstream_distances = self.region_distances[self.upstream_mask], 
+            downstream_distances = self.region_distances[self.downstream_mask], 
+            promoter_weights = weights[:, self.promoter_mask], 
+            upstream_weights = weights[:, self.upstream_mask], 
+            downstream_weights = weights[:, self.downstream_mask], 
+            read_depth = read_depth,
+            gene_expr = expression
         )
 
         self.trace = self.sample_posterior(posterior_samples)
         self.summarize_params()
 
         return self
-
-    def sample_posterior(self, num_samples = 200, attempts = 5):
-
-        for i in range(attempts):
-            try:
-
-                samples = Predictive(self.model, guide=self.guide, num_samples=num_samples,
-                                    return_sites=self.model.get_varnames())()
-                return {varname.split('_')[-1] : samples[varname].detach().numpy() for varname in self.model.get_varnames()}
-
-            except ValueError:
-                pass
-
-        raise ValueError('Posterior contains improper values')
 
     def get_rp_function(self):
 
@@ -353,61 +426,30 @@ class RPModel:
         )
 
     def get_log_expr_rate(self, region_weights):
-
         return self.get_rp_function().get_log_expr_rate(region_weights)
 
-'''class TransEffectModel(RPModel):
 
-    var_names = ['beta','b','dropout','theta']
-    batch_size = 64
+class TransEffectModel(ExprModel):
 
-    def __init__(self):
-        pass
+    def __init__(self, gene_symbols):
+        self.gene_symbols = gene_symbols
 
-    def summarize_trace(self, *args, **kwargs):
-        return None
+    def fit(self,*, cell_topic_weights, gene_expr, read_depth, posterior_samples = 200):
 
-    def get_rp_function():
-        raise NotImplementedError()
+        self.model, self.guide = PyroTransEffectModel.train(
+            self.gene_symbols,
+            cell_topic_weights = cell_topic_weights, 
+            read_depth = read_depth,
+            gene_expr = gene_expr
+        )
 
-    def make_model(self,*, weights, topic_distribution, expression, read_depth):
+        self.trace = self.sample_posterior(posterior_samples)
+        self.summarize_params()
 
-        K = topic_distribution.shape[-1]
-        N,G = expression.shape
-        
-        self.mixing_weights = pm.Minibatch(topic_distribution, batch_size=self.batch_size)
-        self.read_depth_batches = pm.Minibatch(read_depth[:,np.newaxis].copy(), batch_size=self.batch_size)
-        self.expression_batches = pm.Minibatch(expression, batch_size=self.batch_size)
-        
-        with pm.Model() as model:
+        return self
 
-            beta = pm.Gamma('beta', alpha = 1, beta = 1, shape = (K,G))
-
-            b = pm.Normal('b', mu = 0, sigma = 100, shape = (1,G))
-
-            self.log_rate_expr = tt.dot(self.mixing_weights, beta) + b # (N,K) * (K,G) + (1,G) -> (N,G)
-
-            dropout = pm.Beta('dropout', alpha = 1, beta = 10, testval = 0.2, shape = (1,G))
-
-            dispersion = pm.Gamma('theta', alpha = 2, beta = 1/2, testval = 2, shape = (1,G))
-            
-            X = pm.ZeroInflatedNegativeBinomial('expr', mu = tt.addbroadcast(self.read_depth_batches, 1) * tt.exp(self.log_rate_expr), psi = dropout, 
-                            alpha = dispersion, observed = self.expression_batches, total_size = N)
-            
-        return model
-
-    def sample_node(self, model, node, num_samples = 300):
-        with model:
-            return self.mean_field.sample_node(node, 
-                    more_replacements={
-                        self.read_depth_batches.minibatch : self.read_depth_batches.shared,
-                        self.mixing_weights.minibatch : self.mixing_weights.shared,
-                        self.expression_batches.minibatch : self.expression_batches.shared
-                    }, size = num_samples).eval()
-
-    def get_log_expr_rate(self, topic_distribution, region_weights):
-
-        return np.dot(topic_distribution, self.beta) + self.b'''
+    def get_log_expr_rate(self, cell_topic_weights):
+        return np.dot(cell_topic_weights, self.beta) + self.b
 
 
 def main(*,genes_file, species, peaks_file, read_depth_array, expr_matrix, cell_topic_distribution_matrix, 
