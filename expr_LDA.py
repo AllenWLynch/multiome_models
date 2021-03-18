@@ -58,10 +58,19 @@ class Encoder(nn.Module):
 
 class ProdLDA(PyroModule):
 
-    var_names = ['dispersion','dropout','theta','expr_rate']
+    local_vars = ['theta','expr_rate']
+    global_vars = ['dispersion','dropout']
 
-    def __init__(self, num_genes,num_topics = 15, dropout = 0.2, hidden = 100):
+    var_names = local_vars + global_vars
+
+    def __init__(self, num_genes,num_topics = 15, initial_counts = 50, dropout = 0.2, hidden = 128):
         super().__init__()
+
+        assert(isinstance(initial_counts, int))
+
+        a = initial_counts/num_topics
+        self.prior_mu = 0
+        self.prior_std = np.sqrt(1/a * (1-2/num_topics) + 1/(num_topics * a))
 
         self.num_genes = num_genes
         self.num_topics = num_topics
@@ -83,7 +92,7 @@ class ProdLDA(PyroModule):
     def summarize_params(self, metric = np.mean):
         logging.info('Summarizing params ...')
 
-        for param in self.trace.keys():
+        for param in self.var_names:
             self.__setattr__(param, metric(self.trace[param], axis = 0))
 
     def get_log_expr_rate(self, *args, **kwargs):
@@ -102,8 +111,8 @@ class ProdLDA(PyroModule):
         with pyro.plate("cells", encoded_expr.shape[0]):
             # Dirichlet prior  𝑝(𝜃|𝛼) is replaced by a log-normal distribution
 
-            theta_loc = encoded_expr.new_zeros((encoded_expr.shape[0], self.num_topics))
-            theta_scale = encoded_expr.new_ones((encoded_expr.shape[0], self.num_topics))
+            theta_loc = self.prior_mu * encoded_expr.new_ones((encoded_expr.shape[0], self.num_topics))
+            theta_scale = self.prior_std * encoded_expr.new_ones((encoded_expr.shape[0], self.num_topics))
             theta = pyro.sample(
                 "theta", dist.LogNormal(theta_loc, theta_scale).to_event(1))
             theta = theta/theta.sum(-1, keepdim = True)
@@ -147,35 +156,47 @@ class ProdLDA(PyroModule):
 
         logging.info('Sampling posterior ...')
 
-        posterior_predictive = Predictive(self.model, guide=self.guide, num_samples=num_samples,
+        self.posterior_predictive = Predictive(self.model, guide=self.guide, num_samples=num_samples,
                     return_sites=self.var_names)
                     
         trace = {}
         for i,batch in enumerate(self.epoch_batch(raw_expr, encoded_expr, read_depth, batch_size = 512)):
             
-            samples = posterior_predictive(*batch)
-
-            for varname in self.var_names:
+            samples = self.posterior_predictive(*batch)
+            
+            if i == 0:
+                for varname in self.global_vars:
+                    new_samples = samples[varname].detach().numpy()
+                    trace[varname] = new_samples
+            
+            for varname in self.local_vars:
                 new_samples = samples[varname].detach().numpy()
-
+                
                 if not varname in trace:
-                    trace[varname]=[new_samples]
-                else:
-                    trace[varname].append(new_samples)
+                    trace[varname] = []
+                trace[varname].append(new_samples)
 
             logging.info('Done {} batches.'.format(str(i+1)))
 
-        for varname in self.var_names:
-            trace[varname] = np.vstack(trace[varname])
+        for varname in self.local_vars:
+            trace[varname] = np.concatenate(trace[varname], axis = 1)
 
-        trace['beta'] = self.beta()
+        trace['beta'] = self.get_beta()
+        trace['bias'] = self.get_bias()
 
         return trace
+
+    @staticmethod
+    def softmax(x):
+        return np.exp(x)/np.exp(x).sum(-1, keepdims = True)
+
+    def predict(self, theta):
+        return self.softmax(np.dot(self.theta, self.trace['beta']) + self.trace['bias'][np.newaxis, :])
 
     def epoch_batch(self, *data, batch_size = 32):
 
         N = len(data[0])
-        num_batches = N//batch_size
+        num_batches = N//batch_size + int(N % batch_size > 0)
 
         for i in range(num_batches):
             batch_start, batch_end = (i * batch_size, (i + 1) * batch_size)
@@ -183,7 +204,7 @@ class ProdLDA(PyroModule):
             yield list(map(lambda x : x[batch_start:batch_end], data))
 
     def train(self, *, raw_expr, encoded_expr, read_depth, num_epochs = 100, 
-            batch_size = 32, learning_rate = 1e-3, posterior_samples = 200):
+            batch_size = 32, learning_rate = 1e-3, posterior_samples = 20):
 
         logging.info('Initializing model ...')
 
@@ -214,12 +235,15 @@ class ProdLDA(PyroModule):
 
         return self
 
-    def beta(self):
+    def get_beta(self):
         # beta matrix elements are the weights of the FC layer on the decoder
         return self.decoder.beta.weight.cpu().detach().T.numpy()
 
-def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_layers=100,
-    learning_rate = 1e-3, epochs = 100, batch_size = 32, posterior_samples = 200):
+    def get_bias(self):
+        return self.decoder.beta.bias.cpu().detach().T.numpy()
+
+def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_layers=128,
+    learning_rate = 1e-3, epochs = 100, batch_size = 32, posterior_samples = 20):
 
     raw_expr = np.load(raw_expr)
     encoded_expr = np.load(encoded_expr)
