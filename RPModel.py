@@ -200,12 +200,12 @@ class RPModelPointEstimator:
 
     def posterior_ISD(self, reg_state, motif_hits):
 
-        assert(motif_hits.shape[1] == reg_state.shape[0])
+        #assert(motif_hits.shape[1] == reg_state.shape[0])
         assert(len(reg_state.shape) == 1)
 
-        reg_state = reg_state[self.region_score_map][self.region_mask][np.newaxis, :]
+        reg_state = reg_state[self.region_mask][np.newaxis, :]
 
-        motif_hits = np.array(motif_hits[:,self.region_score_map][:, self.region_mask].todense())
+        motif_hits = np.array(motif_hits[:, self.region_mask].todense())
 
         isd_mask = np.maximum(1 - motif_hits, 0)
 
@@ -213,7 +213,7 @@ class RPModelPointEstimator:
 
         rp_scores = np.exp(self.get_log_expr_rate(isd_states))
 
-        return rp_scores[1:], rp_scores[0]
+        return 1 - rp_scores[1:]/rp_scores[0]
 
 
 class PyroModel(PyroModule):
