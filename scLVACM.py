@@ -177,6 +177,7 @@ class scVLACM(nn.Module):
         trace = {}
         for i,batch in enumerate(self.epoch_batch(peak_idx, read_depth, batch_size = 512)):
             
+            print('here')
             samples = self.posterior_predictive(*batch)
             
             if i == 0:
