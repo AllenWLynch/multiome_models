@@ -219,18 +219,16 @@ class scVLXCM(nn.Module):
 
             yield list(map(lambda x : x[batch_start:batch_end], data))
 
-    def train(self, *, raw_expr, encoded_expr, read_depth, num_epochs = 100, 
+    def train(self, *, raw_expr, encoded_expr, num_epochs = 100, 
             batch_size = 32, learning_rate = 1e-3, posterior_samples = 20):
 
         logging.info('Validating data ...')
 
         assert(raw_expr.shape == encoded_expr.shape)
-        assert(raw_expr.shape[0] == read_depth.shape[0])
-        assert(len(read_depth.shape) == 1)
-
+        
+        read_depth = torch.tensor(raw_expr.sum(-1)[:, np.newaxis]).to(self.device)
         raw_expr = torch.tensor(raw_expr).to(self.device)
         encoded_expr = torch.tensor(encoded_expr).to(self.device)
-        read_depth = torch.tensor(read_depth[:, np.newaxis]).to(self.device)
 
         logging.info('Initializing model ...')
 
@@ -275,17 +273,15 @@ class scVLXCM(nn.Module):
     def get_bn_var(self):
         return self.decoder.bn.running_var.cpu().detach().numpy()
 
-def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_layers=128,
+def main(*,raw_expr, encoded_expr, save_file, topics = 32, hidden_layers=128,
     learning_rate = 1e-3, epochs = 100, batch_size = 32, posterior_samples = 20, initial_counts = 50):
 
     raw_expr = np.load(raw_expr)
     encoded_expr = np.load(encoded_expr)
-    read_depth = np.load(read_depth)
 
     seed = 2556
     torch.manual_seed(seed)
-    pyro.set_rng_seed(seed)
-    
+    pyro.set_rng_seed(seed)    
 
     rna_topic = scVLXCM(raw_expr.shape[-1], num_topics = topics, dropout = 0.2, 
         hidden = hidden_layers, initial_counts = initial_counts)
@@ -293,7 +289,6 @@ def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_la
     rna_topic.train(
         raw_expr = raw_expr,
         encoded_expr = encoded_expr,
-        read_depth = read_depth,
         num_epochs = epochs,
         batch_size = batch_size,
         learning_rate = learning_rate,
