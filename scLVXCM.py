@@ -54,8 +54,9 @@ class Encoder(nn.Module):
         theta_scale = self.bnlv(self.fclv(h))
         theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
         return theta_loc, theta_scale
+        
 
-class scVLXCM_Estimator:
+class scVLCM_Estimator:
 
     def __init__(self,**kwargs):
         self.__dict__.update(kwargs)
@@ -72,13 +73,10 @@ class scVLXCM_Estimator:
         return self.softmax(self.gamma * activation + self.bias)
 
 
-class scVLXCM(nn.Module):
+class ExpressionModel(nn.Module):
 
-    local_vars = ['theta']
-    global_vars = ['dispersion','dropout']
-
-    var_names = local_vars + global_vars
-    variational_vars = var_names + ['beta', 'bias','gamma','bn_mean','bn_var']
+    guide_vars = ['gamma_a','gamma_b','dropout_a','dropout_b']
+    variational_vars = ['theta','beta', 'bias','gamma','bn_mean','bn_var']
 
     @classmethod
     def get_estimator_from_trace(cls, prefix):
@@ -92,7 +90,7 @@ class scVLXCM(nn.Module):
             except FileNotFoundError:
                 raise Exception('Cannot make model estimator, missing file: {}'.format(filename))
 
-        return scVLXCM_Estimator(**trace)
+        return scVLCM_Estimator(**trace)
 
     def __init__(self, num_genes,num_topics = 15, initial_counts = 50, 
         dropout = 0.2, hidden = 128, use_cuda = True):
@@ -117,11 +115,11 @@ class scVLXCM(nn.Module):
         self.max_prob = torch.tensor([0.99999], requires_grad = False).to(self.device)
 
     def get_estimator(self):
-        return scVLXCM_Estimator(**{varname : getattr(self, varname) for varname in self.variational_vars})
+        return scVLCM_Estimator(**{varname : getattr(self, varname) for varname in self.variational_vars})
 
     def write_trace(self, prefix):
         logging.info('Writing results ...')
-        for varname in self.variational_vars:
+        for varname in self.variational_vars + self.guide_vars:
             np.save(prefix + '_{}.npy'.format(varname), getattr(self, varname))
 
     def model(self, raw_expr, encoded_expr, read_depth):
@@ -178,45 +176,32 @@ class scVLXCM(nn.Module):
                 "theta", dist.LogNormal(theta_loc, theta_scale).to_event(1))
 
 
-    def summarize_posterior(self, raw_expr, encoded_expr, read_depth, 
-        num_samples = 200, attempts = 5):
+    def get_latent_MAP(self, encoded_expr):
+        theta_loc, theta_scale = self.encoder(encoded_expr)
+        return np.exp(theta_loc.cpu().detach().numpy())
+
+
+    def summarize_posterior(self, raw_expr, encoded_expr, read_depth):
 
         logging.info('Sampling posterior ...')
-
-        self.posterior_predictive = Predictive(self.model, guide=self.guide, num_samples=num_samples,
-                    return_sites=self.var_names)
-                    
-        trace = {}
+        
+        #Local vars
+        latent_vars = []
         for i,batch in enumerate(self.epoch_batch(raw_expr, encoded_expr, read_depth, batch_size = 512)):
-            
-            samples = self.posterior_predictive(*batch)
-            
-            if i == 0:
-                for varname in self.global_vars:
-                    new_samples = samples[varname].cpu().detach().numpy()
-                    trace[varname] = new_samples
-            
-            for varname in self.local_vars:
-                new_samples = samples[varname].cpu().detach().numpy()
-                
-                if not varname in trace:
-                    trace[varname] = []
-                trace[varname].append(new_samples)
+            latent_vars.append(self.get_latent_MAP(batch[1]))
 
-            logging.info('Done {} batches.'.format(str(i+1)))
-
-        for varname in self.local_vars:
-            trace[varname] = np.concatenate(trace[varname], axis = 1)
-
-        for varname in self.var_names:
-            self.__setattr__(varname, np.mean(trace[varname], axis = 0))
-
+        self.theta = np.vstack(latent_vars)
+        #Decoder vars
         self.beta = self.get_beta()
         self.gamma = self.get_gamma()
         self.bias = self.get_bias()
         self.bn_mean = self.get_bn_mean()
         self.bn_var = self.get_bn_var()
 
+        #Guide vars
+        for guide_var in self.guide_vars:
+            self.__setattr__(guide_var, pyro.param(guide_var).item().cpy().detach().numpy())
+        
         return self
 
     def epoch_batch(self, *data, batch_size = 32):
@@ -262,8 +247,7 @@ class scVLXCM(nn.Module):
         except KeyboardInterrupt:
             logging.error('Interrupted training.')
 
-        self.summarize_posterior(raw_expr, encoded_expr, read_depth, 
-                num_samples = posterior_samples)
+        self.summarize_posterior(raw_expr, encoded_expr, read_depth)
 
         return self
 
@@ -284,7 +268,7 @@ class scVLXCM(nn.Module):
         return self.decoder.bn.running_var.cpu().detach().numpy()
 
 def main(*,raw_expr, encoded_expr, save_file, topics = 32, hidden_layers=128,
-    learning_rate = 1e-3, epochs = 100, batch_size = 32, posterior_samples = 20, initial_counts = 50):
+    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts = 20):
 
     raw_expr = np.load(raw_expr)
     encoded_expr = np.load(encoded_expr)
@@ -293,19 +277,18 @@ def main(*,raw_expr, encoded_expr, save_file, topics = 32, hidden_layers=128,
     torch.manual_seed(seed)
     pyro.set_rng_seed(seed)    
 
-    rna_topic = scVLXCM(raw_expr.shape[-1], num_topics = topics, dropout = 0.2, 
+    model = ExpressionModel(raw_expr.shape[-1], num_topics = topics, dropout = 0.2, 
         hidden = hidden_layers, initial_counts = initial_counts)
 
-    rna_topic.train(
+    model.train(
         raw_expr = raw_expr,
         encoded_expr = encoded_expr,
         num_epochs = epochs,
         batch_size = batch_size,
-        learning_rate = learning_rate,
-        posterior_samples = posterior_samples
+        learning_rate = learning_rate
     )
 
-    rna_topic.write_trace(save_file)
+    model.write_trace(save_file)
 
 if __name__ == "__main__":
     fire.Fire(main)

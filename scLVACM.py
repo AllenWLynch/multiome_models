@@ -14,7 +14,7 @@ import fire
 from pyro.infer import Predictive
 import logging
 import pickle
-from scipy.sparse import isspmatrix
+from scipy.sparse import isspmatrix, load_npz
 
 logging.basicConfig(level = logging.INFO)
 logger = logging.Logger('ExprLDA')
@@ -50,7 +50,7 @@ class DANEncoder(nn.Module):
         theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
         return theta_loc, theta_scale
 
-class scVLXCM_Estimator:
+class scVLCM_Estimator:
 
     def __init__(self,**kwargs):
         self.__dict__.update(kwargs)
@@ -80,12 +80,9 @@ class Decoder(nn.Module):
         return F.softmax(self.bn(self.beta(inputs)), dim=1)
 
 
-class scVLACM(nn.Module):
+class AccessibilityModel(nn.Module):
 
-    local_vars = ['theta']
-
-    var_names = local_vars
-    variational_vars = var_names + ['beta', 'bias','gamma','bn_mean','bn_var']
+    variational_vars = ['theta','beta', 'bias','gamma','bn_mean','bn_var']
 
     @classmethod
     def get_estimator_from_trace(cls, prefix):
@@ -99,7 +96,7 @@ class scVLACM(nn.Module):
             except FileNotFoundError:
                 raise Exception('Cannot make model estimator, missing file: {}'.format(filename))
 
-        return scVLXCM_Estimator(**trace)
+        return scVLCM_Estimator(**trace)
 
     def __init__(self, num_peaks, num_topics = 15, initial_counts = 20, 
         dropout = 0.2, hidden = 128, use_cuda = True):
@@ -123,7 +120,7 @@ class scVLACM(nn.Module):
         self.to(self.device)
 
     def get_estimator(self):
-        return scVLXCM_Estimator(**{varname : getattr(self, varname) for varname in self.variational_vars})
+        return scVLCM_Estimator(**{varname : getattr(self, varname) for varname in self.variational_vars})
 
     def write_trace(self, prefix):
         logging.info('Writing results ...')
@@ -165,41 +162,21 @@ class scVLACM(nn.Module):
             theta = pyro.sample(
                 "theta", dist.LogNormal(theta_loc, theta_scale).to_event(1))
 
+    def get_latent_MAP(self, idx, read_depth):
+        theta_loc, theta_scale = self.encoder(idx, read_depth)
+        return np.exp(theta_loc.cpu().detach().numpy())
 
-    def summarize_posterior(self, peak_idx, read_depth, 
-        num_samples = 200, attempts = 5):
+    def summarize_posterior(self, peak_idx, read_depth):
 
         logging.info('Sampling posterior ...')
 
-        self.posterior_predictive = Predictive(self.model, guide=self.guide, num_samples=num_samples,
-                    return_sites=self.var_names)
-                    
-        trace = {}
-        for i,batch in enumerate(self.epoch_batch(peak_idx, read_depth, batch_size = 512)):
-            
-            print('here')
-            samples = self.posterior_predictive(*batch)
-            
-            if i == 0:
-                for varname in self.global_vars:
-                    new_samples = samples[varname].cpu().detach().numpy()
-                    trace[varname] = new_samples
-            
-            for varname in self.local_vars:
-                new_samples = samples[varname].cpu().detach().numpy()
-                
-                if not varname in trace:
-                    trace[varname] = []
-                trace[varname].append(new_samples)
+        #Local vars    
+        latent_vars = []
+        for i,(idx, rd, _) in enumerate(self.epoch_batch(peak_idx, read_depth, batch_size = 512)):
+            latent_vars.append(self.get_latent_MAP(idx, rd))
 
-            logging.info('Done {} batches.'.format(str(i+1)))
-
-        for varname in self.local_vars:
-            trace[varname] = np.concatenate(trace[varname], axis = 1)
-
-        for varname in self.var_names:
-            self.__setattr__(varname, np.mean(trace[varname], axis = 0))
-
+        self.theta = np.vstack(latent_vars)
+        #Decoder vars
         self.beta = self.get_beta()
         self.gamma = self.get_gamma()
         self.bias = self.get_bias()
@@ -242,7 +219,7 @@ class scVLACM(nn.Module):
 
 
     def train(self, *, accessibility_matrix, num_epochs = 125, 
-            batch_size = 32, learning_rate = 1e-3, posterior_samples = 20):
+            batch_size = 32, learning_rate = 1e-3):
 
         logging.info('Validating data ...')
 
@@ -274,8 +251,7 @@ class scVLACM(nn.Module):
         except KeyboardInterrupt:
             logging.error('Interrupted training.')
 
-        self.summarize_posterior(peak_idx_matrix, read_depth, 
-                num_samples = posterior_samples)
+        self.summarize_posterior(peak_idx_matrix, read_depth)
 
         return self
 
@@ -297,31 +273,25 @@ class scVLACM(nn.Module):
 
 
 def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_layers=128,
-    learning_rate = 1e-3, epochs = 100, batch_size = 32, posterior_samples = 20, initial_counts = 50):
+    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts = 50):
 
-    raw_expr = np.load(raw_expr)
-    encoded_expr = np.load(encoded_expr)
-    read_depth = np.load(read_depth)
+    accessibility_matrix = load_npz(accessibility_matrix)
 
     seed = 2556
     torch.manual_seed(seed)
     pyro.set_rng_seed(seed)
     
-
-    rna_topic = scVLXCM(raw_expr.shape[-1], num_topics = topics, dropout = 0.2, 
+    model = AccessibilityModel(accessibility_matrix.shape[1], num_topics = topics, dropout = 0.2, 
         hidden = hidden_layers, initial_counts = initial_counts)
 
-    rna_topic.train(
-        raw_expr = raw_expr,
-        encoded_expr = encoded_expr,
-        read_depth = read_depth,
+    model.train(
+        accessibility_matrix=accessibility_matrix,
         num_epochs = epochs,
         batch_size = batch_size,
         learning_rate = learning_rate,
-        posterior_samples = posterior_samples
     )
 
-    rna_topic.write_trace(save_file)
+    model.write_trace(save_file)
 
 if __name__ == "__main__":
     fire.Fire(main)
