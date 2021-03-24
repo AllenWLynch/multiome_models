@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pyro.optim import Adam
 from pyro.infer import SVI, TraceMeanField_ELBO
-from tqdm import trange
+from tqdm import tqdm
 from pyro.nn import PyroModule
 import numpy as np
 import torch.distributions.constraints as constraints
@@ -16,9 +16,9 @@ import logging
 import pickle
 from scipy.sparse import isspmatrix, load_npz
 
-logging.basicConfig(level = logging.INFO)
+logging.basicConfig(level = logging.DEBUG)
 logger = logging.Logger('ExprLDA')
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 class DANEncoder(nn.Module):
 
@@ -49,6 +49,30 @@ class DANEncoder(nn.Module):
         theta_scale = self.bnlv(self.fclv(h))
         theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
         return theta_loc, theta_scale
+
+
+class Encoder(nn.Module):
+    # Base class for the encoder net, used in the guide
+    def __init__(self, vocab_size, num_topics, hidden, dropout):
+        super().__init__()
+        self.drop = nn.Dropout(dropout)  # to avoid component collapse
+        self.fc1 = nn.Linear(vocab_size, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fcmu = nn.Linear(hidden, num_topics)
+        self.fclv = nn.Linear(hidden, num_topics)
+        self.bnmu = nn.BatchNorm1d(num_topics)  # to avoid component collapse
+        self.bnlv = nn.BatchNorm1d(num_topics)  # to avoid component collapse
+
+    def forward(self, inputs):
+        h = F.softplus(self.fc1(inputs))
+        h = F.softplus(self.fc2(h))
+        h = self.drop(h)
+        # μ and Σ are the outputs
+        theta_loc = self.bnmu(self.fcmu(h))
+        theta_scale = self.bnlv(self.fclv(h))
+        theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
+        return theta_loc, theta_scale
+
 
 class scVLCM_Estimator:
 
@@ -166,13 +190,13 @@ class AccessibilityModel(nn.Module):
         theta_loc, theta_scale = self.encoder(idx, read_depth)
         return np.exp(theta_loc.cpu().detach().numpy())
 
-    def summarize_posterior(self, peak_idx, read_depth):
+    def summarize_posterior(self, accessibility_matrix):
 
         logging.info('Sampling posterior ...')
 
         #Local vars    
         latent_vars = []
-        for i,(idx, rd, _) in enumerate(self.epoch_batch(peak_idx, read_depth, batch_size = 512)):
+        for idx, rd, _ in self.epoch_batch(accessibility_matrix, batch_size = 32):
             latent_vars.append(self.get_latent_MAP(idx, rd))
 
         self.theta = np.vstack(latent_vars)
@@ -186,49 +210,50 @@ class AccessibilityModel(nn.Module):
         return self
 
     def get_onehot_tensor(self, idx):
-        return torch.zeros(idx.shape[0], self.num_peaks).scatter_(1, idx, 1).to(self.device)
+        return torch.zeros(idx.shape[0], self.num_peaks, device = self.device).scatter_(1, idx, 1).to(self.device)
 
-    def epoch_batch(self, peak_idx, read_depth, batch_size = 32):
+    def get_padded_idx_matrix(self, accessibility_matrix, read_depth):
 
-        N = peak_idx.shape[0]
-        num_batches = N//batch_size + int(N % batch_size > 0)
-
-        for i in range(num_batches):
-            batch_start, batch_end = (i * batch_size, (i + 1) * batch_size)
-
-            idx_batch = peak_idx[batch_start : batch_end]
-            yield idx_batch, read_depth[batch_start:batch_end], self.get_onehot_tensor(idx_batch)
-
-    def get_padded_idx_matrix(self, accessibility_matrix):
-        
-        assert(isspmatrix(accessibility_matrix))
-        assert(accessibility_matrix.shape[1] <= self.num_peaks)
-
-        X = accessibility_matrix.tolil().rows
+        width = read_depth.max()
 
         dense_matrix = []
-        for row in X:
-            if len(row) == self.num_peaks:
+        for i in range(accessibility_matrix.shape[0]):
+            row = accessibility_matrix[i,:].indices
+            if len(row) == width:
                 dense_matrix.append(np.array(row)[np.newaxis, :])
             else:
-                dense_matrix.append(np.concatenate([np.array(row), np.zeros(self.num_peaks - len(row))])[np.newaxis, :]) #0-pad tail to "width"
+                dense_matrix.append(np.concatenate([np.array(row), np.zeros(width - len(row))])[np.newaxis, :]) #0-pad tail to "width"
 
         dense_matrix = np.vstack(dense_matrix)
         
         return dense_matrix.astype(np.int64)
 
 
+    def epoch_batch(self, accessibility_matrix, batch_size = 32):
+
+        N = accessibility_matrix.shape[0]
+        num_batches = N//batch_size + int(N % batch_size > 0)
+
+        assert(isspmatrix(accessibility_matrix))
+        assert(accessibility_matrix.shape[1] <= self.num_peaks)
+
+        accessibility_matrix = accessibility_matrix.tocsr()
+        read_depth = torch.from_numpy(np.array(accessibility_matrix.sum(-1))).to(self.device)
+
+        for i in tqdm(range(num_batches), desc = 'Epoch progress'):
+            batch_start, batch_end = (i * batch_size, (i + 1) * batch_size)
+
+            rd_batch = read_depth[batch_start:batch_end]
+            idx_batch = torch.from_numpy(self.get_padded_idx_matrix(accessibility_matrix[batch_start : batch_end], rd_batch)).to(self.device)
+            onehot_batch = self.get_onehot_tensor(idx_batch)
+
+            yield idx_batch, read_depth[batch_start:batch_end], onehot_batch
+
+
     def train(self, *, accessibility_matrix, num_epochs = 125, 
             batch_size = 32, learning_rate = 1e-3):
 
-        logging.info('Validating data ...')
 
-        peak_idx_matrix = self.get_padded_idx_matrix(accessibility_matrix)
-        read_depth = (peak_idx_matrix > 0).sum(-1, keepdims = True).astype(np.int64)
-
-        peak_idx_matrix = torch.tensor(peak_idx_matrix).to(self.device)
-        read_depth = torch.tensor(read_depth).to(self.device)
-        
         logging.info('Initializing model ...')
         pyro.clear_param_store()
         adam_params = {"lr": 1e-3}
@@ -236,22 +261,22 @@ class AccessibilityModel(nn.Module):
         svi = SVI(self.model, self.guide, optimizer, loss=TraceMeanField_ELBO())
 
         logging.info('Training ...')
-        num_batches = read_depth.shape[0]//batch_size
-        bar = trange(num_epochs)
-
+        num_batches = accessibility_matrix.shape[0]//batch_size
+        
+        logging.info('Training for {} epochs'.format(str(num_epochs)))
         try:
-            for epoch in bar:
+            for epoch in range(num_epochs):
                 running_loss = 0.0
-                for batch in self.epoch_batch(peak_idx_matrix, read_depth, batch_size = batch_size):
+                for batch in self.epoch_batch(accessibility_matrix, batch_size = batch_size):
                     loss = svi.step(*batch)
                     running_loss += loss / batch_size
 
-                bar.set_postfix(epoch_loss='{:.2e}'.format(running_loss))
+                logging.info('Done epoch {}/{}. Training loss: {:.3e}'.format(str(epoch+1), str(num_epochs), running_loss))
 
         except KeyboardInterrupt:
             logging.error('Interrupted training.')
 
-        self.summarize_posterior(peak_idx_matrix, read_depth)
+        self.summarize_posterior(accessibility_matrix)
 
         return self
 
@@ -272,8 +297,8 @@ class AccessibilityModel(nn.Module):
         return self.decoder.bn.running_var.cpu().detach().numpy()
 
 
-def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_layers=128,
-    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts = 50):
+def main(*,accessibility_matrix, save_file, topics = 32, hidden_layers=128,
+    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts =20, dropout = 0.2):
 
     accessibility_matrix = load_npz(accessibility_matrix)
 
@@ -281,7 +306,7 @@ def main(*,raw_expr, encoded_expr, read_depth, save_file, topics = 32, hidden_la
     torch.manual_seed(seed)
     pyro.set_rng_seed(seed)
     
-    model = AccessibilityModel(accessibility_matrix.shape[1], num_topics = topics, dropout = 0.2, 
+    model = AccessibilityModel(accessibility_matrix.shape[1], num_topics = topics, dropout = dropout, 
         hidden = hidden_layers, initial_counts = initial_counts)
 
     model.train(

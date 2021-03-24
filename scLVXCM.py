@@ -200,7 +200,7 @@ class ExpressionModel(nn.Module):
 
         #Guide vars
         for guide_var in self.guide_vars:
-            self.__setattr__(guide_var, pyro.param(guide_var).item().cpy().detach().numpy())
+            self.__setattr__(guide_var, pyro.param(guide_var).item())
         
         return self
 
