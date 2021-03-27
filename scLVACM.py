@@ -27,7 +27,7 @@ class DANEncoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.drop2 = nn.Dropout(dropout)
         self.embedding = nn.Embedding(num_peaks, hidden, padding_idx=0)
-        self.fc1 = nn.Linear(hidden, hidden)
+        self.fc1 = nn.Linear(hidden + 1, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fcmu = nn.Linear(hidden, num_topics)
         self.fclv = nn.Linear(hidden, num_topics)
@@ -40,33 +40,11 @@ class DANEncoder(nn.Module):
         
         ave_embeddings = embeddings.sum(1)/read_depth
 
-        h = F.softplus(self.fc1(ave_embeddings))
+        h = torch.cat([ave_embeddings, read_depth.log()], dim = 1) #inject read depth into model
+        h = F.softplus(self.fc1(h))
         h = F.softplus(self.fc2(h))
         h = self.drop2(h)
 
-        # μ and Σ are the outputs
-        theta_loc = self.bnmu(self.fcmu(h))
-        theta_scale = self.bnlv(self.fclv(h))
-        theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
-        return theta_loc, theta_scale
-
-
-class Encoder(nn.Module):
-    # Base class for the encoder net, used in the guide
-    def __init__(self, vocab_size, num_topics, hidden, dropout):
-        super().__init__()
-        self.drop = nn.Dropout(dropout)  # to avoid component collapse
-        self.fc1 = nn.Linear(vocab_size, hidden)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.fcmu = nn.Linear(hidden, num_topics)
-        self.fclv = nn.Linear(hidden, num_topics)
-        self.bnmu = nn.BatchNorm1d(num_topics)  # to avoid component collapse
-        self.bnlv = nn.BatchNorm1d(num_topics)  # to avoid component collapse
-
-    def forward(self, inputs):
-        h = F.softplus(self.fc1(inputs))
-        h = F.softplus(self.fc2(h))
-        h = self.drop(h)
         # μ and Σ are the outputs
         theta_loc = self.bnmu(self.fcmu(h))
         theta_scale = self.bnlv(self.fclv(h))
@@ -186,6 +164,8 @@ class AccessibilityModel(nn.Module):
             theta = pyro.sample(
                 "theta", dist.LogNormal(theta_loc, theta_scale).to_event(1))
 
+
+
     def get_latent_MAP(self, idx, read_depth):
         theta_loc, theta_scale = self.encoder(idx, read_depth)
         return np.exp(theta_loc.cpu().detach().numpy())
@@ -229,7 +209,7 @@ class AccessibilityModel(nn.Module):
         return dense_matrix.astype(np.int64)
 
 
-    def epoch_batch(self, accessibility_matrix, batch_size = 32):
+    def epoch_batch(self, accessibility_matrix, batch_size = 32, bar = True):
 
         N = accessibility_matrix.shape[0]
         num_batches = N//batch_size + int(N % batch_size > 0)
@@ -240,7 +220,7 @@ class AccessibilityModel(nn.Module):
         accessibility_matrix = accessibility_matrix.tocsr()
         read_depth = torch.from_numpy(np.array(accessibility_matrix.sum(-1))).to(self.device)
 
-        for i in tqdm(range(num_batches), desc = 'Epoch progress'):
+        for i in tqdm(range(num_batches), desc = 'Epoch progress') if bar is True else range(num_batches):
             batch_start, batch_end = (i * batch_size, (i + 1) * batch_size)
 
             rd_batch = read_depth[batch_start:batch_end]
@@ -250,28 +230,44 @@ class AccessibilityModel(nn.Module):
             yield idx_batch, read_depth[batch_start:batch_end], onehot_batch
 
 
+    def evaluate(self, accessibility_matrix, batch_size = 32):
+        
+        batch_loss = []
+        for batch in self.epoch_batch(accessibility_matrix, batch_size = batch_size, bar = False):
+
+            loss = self.svi.evaluate_loss(*batch)
+            batch_loss.append(loss)
+
+        return np.array(batch_loss).sum() #loss is negative log-likelihood
+
+
     def train(self, *, accessibility_matrix, num_epochs = 125, 
-            batch_size = 32, learning_rate = 1e-3):
+            batch_size = 32, learning_rate = 1e-3, eval_every = 10, test_proportion = 0.05):
 
 
         logging.info('Initializing model ...')
         pyro.clear_param_store()
         adam_params = {"lr": 1e-3}
         optimizer = Adam(adam_params)
-        svi = SVI(self.model, self.guide, optimizer, loss=TraceMeanField_ELBO())
+        self.svi = SVI(self.model, self.guide, optimizer, loss=TraceMeanField_ELBO())
 
-        logging.info('Training ...')
+        test_set = np.random.rand(accessibility_matrix.shape[0]) < test_proportion
+        train_set = ~test_set
+        logging.info("Training with {} cells, testing with {}.".format(str(train_set.sum()), str(test_set.sum())))
+
         num_batches = accessibility_matrix.shape[0]//batch_size
-        
         logging.info('Training for {} epochs'.format(str(num_epochs)))
         try:
-            for epoch in range(num_epochs):
+            for epoch in range(1, num_epochs + 1):
                 running_loss = 0.0
-                for batch in self.epoch_batch(accessibility_matrix, batch_size = batch_size):
-                    loss = svi.step(*batch)
+                for batch in self.epoch_batch(accessibility_matrix[train_set], batch_size = batch_size):
+                    loss = self.svi.step(*batch)
                     running_loss += loss / batch_size
 
-                logging.info('Done epoch {}/{}. Training loss: {:.3e}'.format(str(epoch+1), str(num_epochs), running_loss))
+                logging.info('Done epoch {}/{}. Training loss: {:.3e}'.format(str(epoch), str(num_epochs), running_loss))
+                if (epoch % eval_every == 0 or epoch == num_epochs) and test_set.sum() > 0:
+                    test_logp = self.evaluate(accessibility_matrix[test_set], batch_size = batch_size)
+                    logging.info('Test logp: {:.4e}'.format(test_logp))
 
         except KeyboardInterrupt:
             logging.error('Interrupted training.')
@@ -298,7 +294,8 @@ class AccessibilityModel(nn.Module):
 
 
 def main(*,accessibility_matrix, save_file, topics = 32, hidden_layers=128,
-    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts =20, dropout = 0.2):
+    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts =20, dropout = 0.2,
+    eval_every = 10, test_proportion = 0.05):
 
     accessibility_matrix = load_npz(accessibility_matrix)
 
@@ -314,6 +311,8 @@ def main(*,accessibility_matrix, save_file, topics = 32, hidden_layers=128,
         num_epochs = epochs,
         batch_size = batch_size,
         learning_rate = learning_rate,
+        eval_every = eval_every,
+        test_proportion = test_proportion
     )
 
     model.write_trace(save_file)
