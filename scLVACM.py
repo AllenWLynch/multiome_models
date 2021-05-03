@@ -41,14 +41,14 @@ class DANEncoder(nn.Module):
         ave_embeddings = embeddings.sum(1)/read_depth
 
         h = torch.cat([ave_embeddings, read_depth.log()], dim = 1) #inject read depth into model
-        h = F.softplus(self.fc1(h))
-        h = F.softplus(self.fc2(h))
+        h = F.relu(self.fc1(h))
+        h = F.relu(self.fc2(h))
         h = self.drop2(h)
 
         # μ and Σ are the outputs
         theta_loc = self.bnmu(self.fcmu(h))
         theta_scale = self.bnlv(self.fclv(h))
-        theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
+        theta_scale = F.softplus(theta_scale)  # Enforces positivity
         return theta_loc, theta_scale
 
 
@@ -247,8 +247,7 @@ class AccessibilityModel(nn.Module):
 
         logging.info('Initializing model ...')
         pyro.clear_param_store()
-        adam_params = {"lr": 1e-3}
-        optimizer = Adam(adam_params)
+        optimizer = Adam({"lr": 1e-3})
         self.svi = SVI(self.model, self.guide, optimizer, loss=TraceMeanField_ELBO())
 
         test_set = np.random.rand(accessibility_matrix.shape[0]) < test_proportion

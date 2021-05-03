@@ -15,6 +15,8 @@ import fire
 from pyro.infer import Predictive
 import logging
 import pickle
+from pyro import poutine
+from pyro.infer.util import torch_item
 
 logging.basicConfig(level = logging.INFO)
 logger = logging.Logger('ExprLDA')
@@ -50,17 +52,17 @@ class Encoder(nn.Module):
         self.bnrd = nn.BatchNorm1d(2)
 
     def forward(self, inputs):
-        h = F.softplus(self.fc1(inputs))
-        h = F.softplus(self.fc2(h))
+        h = F.relu(self.fc1(inputs))
+        h = F.relu(self.fc2(h))
         h = self.drop(h)
         # μ and Σ are the outputs
         theta_loc = self.bnmu(self.fcmu(h))
         theta_scale = self.bnlv(self.fclv(h))
-        theta_scale = (0.5 * theta_scale).exp()  # Enforces positivity
+        theta_scale = F.softplus(theta_scale) #(0.5 * theta_scale).exp()  # Enforces positivity
         
         rd = self.bnrd(self.fcrd(h))
         rd_loc = rd[:,0]
-        rd_scale = (0.5 * rd[:,1]).exp()
+        rd_scale = F.softplus(rd[:,1]) #(0.5 * rd[:,1]).exp()
 
         return theta_loc, theta_scale, rd_loc, rd_scale
 
@@ -121,6 +123,7 @@ class ExpressionModel(nn.Module):
 
         self.to(self.device)
         self.max_prob = torch.tensor([0.99999], requires_grad = False).to(self.device)
+        #self.max_scale = torch.tensor([1e6], requires_grad = False).to(self.device)
 
     def get_estimator(self):
         return scVLCM_Estimator(**{varname : getattr(self, varname) for varname in self.variational_vars})
@@ -150,6 +153,7 @@ class ExpressionModel(nn.Module):
                 'read_depth', dist.LogNormal(torch.log(read_depth), 1.).to_event(1)
             )
 
+            #read_scale = torch.minimum(read_scale, self.max_scale)
             # conditional distribution of 𝑤𝑛 is defined as
             # 𝑤𝑛|𝛽,𝜃 ~ Categorical(𝜎(𝛽𝜃))
             expr_rate, dropout = self.decoder(theta)
@@ -178,22 +182,6 @@ class ExpressionModel(nn.Module):
                 "read_depth", dist.LogNormal(rd_loc.reshape((-1,1)), rd_scale.reshape((-1,1))).to_event(1))
 
 
-    def variational_logp(self, raw_expr, encoded_expr, read_depth):
-
-        dispersion = pyro.param("dispersion")
-
-        theta_mu, theta_std, rd_loc, rd_scale = self.encoder(encoded_expr)
-        theta = torch.exp(theta_mu)/torch.sum(torch.exp(theta_mu), -1, keepdim = True)
-
-        expr_rate, dropout = self.decoder(theta)
-
-        mu = torch.multiply(rd_loc.exp().reshape((-1,1)), expr_rate)
-        p = torch.minimum(mu / (mu + dispersion), self.max_prob)
-
-        logp = dist.ZeroInflatedNegativeBinomial(total_count=dispersion, probs=p, gate_logits=dropout).log_prob(raw_expr)
-
-        return logp
-
     def epoch_batch(self, *data, batch_size = 32, bar = True):
 
         N = len(data[0])
@@ -210,13 +198,34 @@ class ExpressionModel(nn.Module):
         batch_logp = []
         for batch in self.epoch_batch(raw_expr, encoded_expr, read_depth, batch_size = 512, bar = False):
 
-            log_prob = self.variational_logp(*batch)
-            batch_logp.append(log_prob.cpu().detach().numpy())
+            with torch.no_grad():
+                log_prob = torch_item(self.loss.loss(self.model, self.guide, *batch))
 
-        return -1 * np.vstack(batch_logp).sum() #loss is negative log-likelihood
+            batch_logp.append(log_prob)
+
+        return np.array(batch_logp).sum() #loss is negative log-likelihood
+
+    def beta_l1_loss(self):
+        return -dist.Laplace(0., 1.).log_prob(self.decoder.beta.weight).sum()
+
+    def custom_step(self, *batch):
+
+        with poutine.trace(param_only=True) as param_capture:
+            loss = self.loss.differentiable_loss(self.model, self.guide, *batch) + self.beta_l1_loss()
+            
+            params = set(site["value"].unconstrained()
+                            for site in param_capture.trace.nodes.values())
+
+        loss.backward()
+        self.optimizer(params)
+        pyro.infer.util.zero_grads(params)
+
+        return torch_item(loss)
+
 
     def train(self, *, raw_expr, encoded_expr, num_epochs = 100, 
-            batch_size = 32, learning_rate = 1e-3, eval_every = 10, test_proportion = 0.05):
+            batch_size = 32, learning_rate = 1e-3, eval_every = 10, test_proportion = 0.05,
+            use_l1 = False, l1_lam = 0):
 
         seed = 2556
         torch.manual_seed(seed)
@@ -226,8 +235,8 @@ class ExpressionModel(nn.Module):
         logging.info('Validating data ...')
 
         assert(raw_expr.shape == encoded_expr.shape)
-        
         read_depth = raw_expr.sum(-1)[:, np.newaxis]
+
         encoded_expr = np.hstack([encoded_expr, np.log(read_depth)])
 
         read_depth = torch.tensor(read_depth).to(self.device)
@@ -236,9 +245,12 @@ class ExpressionModel(nn.Module):
 
         logging.info('Initializing model ...')
 
-        adam_params = {"lr": 1e-3}
-        optimizer = Adam(adam_params)
-        svi = SVI(self.model, self.guide, optimizer, loss=TraceMeanField_ELBO())
+        self.optimizer = Adam({"lr": 1e-3})
+        self.loss = TraceMeanField_ELBO()
+        
+        if not use_l1:
+            logging.info('No L1 regularization.')
+            svi = SVI(self.model, self.guide, self.optimizer, loss=self.loss)
 
         test_set = np.random.rand(read_depth.shape[0]) < test_proportion
         train_set = ~test_set
@@ -250,7 +262,11 @@ class ExpressionModel(nn.Module):
             for epoch in range(1, num_epochs + 1):
                 running_loss = 0.0
                 for batch in self.epoch_batch(raw_expr[train_set], encoded_expr[train_set], read_depth[train_set], batch_size = batch_size):
-                    loss = svi.step(*batch)
+                    if use_l1:
+                        loss = self.custom_step(*batch)
+                    else:
+                        loss = svi.step(*batch)
+
                     running_loss += loss / batch_size
 
                 logging.info('Done epoch {}/{}. Training loss: {:.3e}'.format(str(epoch), str(num_epochs), running_loss))
@@ -310,12 +326,19 @@ class ExpressionModel(nn.Module):
         return pyro.param("dispersion").cpu().detach().numpy()
 
 def main(*,raw_expr, encoded_expr, save_file, topics = 32, hidden_layers=128,
-    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts = 20, eval_every = 10, test_proportion = 0.05):
+    learning_rate = 1e-3, epochs = 100, batch_size = 32, initial_counts = 20, eval_every = 10, 
+    test_proportion = 0.05, use_l1 = False, dropout = 0.2):
 
-    raw_expr = np.load(raw_expr)
-    encoded_expr = np.load(encoded_expr)
+    raw_expr = np.load(raw_expr).astype(np.float32)
+    encoded_expr = np.load(encoded_expr).astype(np.float32)
 
-    model = ExpressionModel(raw_expr.shape[-1], num_topics = topics, dropout = 0.2, 
+    raw_expr = raw_expr
+    encoded_expr = encoded_expr
+
+    if use_l1:
+        dropout = 0.0
+
+    model = ExpressionModel(raw_expr.shape[-1], num_topics = topics, dropout = dropout, 
         hidden = hidden_layers, initial_counts = initial_counts)
 
     model.train(
@@ -325,7 +348,8 @@ def main(*,raw_expr, encoded_expr, save_file, topics = 32, hidden_layers=128,
         batch_size = batch_size,
         learning_rate = learning_rate,
         eval_every = eval_every,
-        test_proportion = test_proportion
+        test_proportion = test_proportion,
+        use_l1 = use_l1
     )
 
     model.write_trace(save_file)
